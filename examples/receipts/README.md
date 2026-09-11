@@ -120,6 +120,10 @@ qwen2.5 1.5B Q4_K_M, 8 to 12 tokens, 16 to 32 openings, verifier in trace-only m
 
 A larger matrix on the same design, run with a Python prototype of this tracer on the same kernels, is in the author's notes: 28 of 28 verdicts correct on seven cases, plus one case that documents the sampling bound below.
 
+## Proof of one node
+
+`zk/` proves the integer core of one opened matmul node with Expander (GKR over Mersenne-31): the weight's nibbles, scales and mins are private inputs under a hash-based commitment, the Q8_K activation and the per-block sums are public, and the receipt verifier applies the float scales itself. Seconds per node on a laptop. See `zk/README.md`.
+
 ## Limits
 
 - **Sampling bound.** A cheat confined to one node with consistent edges is caught only if that node or a consumer is sampled: with `k` openings over `N` leaves the miss probability is about `1 - (1 + consumers) k / N`. Dense cheats (wrong weights, wrong model, wrong arithmetic everywhere) are what the trace is built for; a targeted single-node fabrication needs full replay or a proof system.
