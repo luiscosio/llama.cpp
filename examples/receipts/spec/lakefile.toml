@@ -1,0 +1,10 @@
+name = "receipts-spec"
+version = "0.1.0"
+defaultTargets = ["ReceiptsSpec", "spec-check"]
+
+[[lean_lib]]
+name = "ReceiptsSpec"
+
+[[lean_exe]]
+name = "spec-check"
+root = "Main"

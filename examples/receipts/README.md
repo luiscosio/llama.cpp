@@ -129,6 +129,10 @@ A larger matrix on the same design, run with a Python prototype of this tracer o
 - **Sidecar size.** Openings are base64 of raw tensor bytes; a KV cache opening at `-c 1024` is about half a megabyte. A 12-token receipt with 32 openings is around 10 MB.
 - **Signatures.** Out of scope here; sign the receipt file externally.
 
+## Formal specification
+
+`spec/` holds the receipt protocol and the Q4_K, Q6_K and Q8_K arithmetic as executable Lean 4 definitions with proofs of the integer-side properties, plus a checker that recomputes a real trace's root, challenge, edges and inputs and reproduces the verifier's arithmetic on test vectors. See `spec/README.md`.
+
 ## Relation to other work
 
 Signed receipts with model hash, seed and decode policy, checked by byte-equality replay, exist in several projects. Tolerant recompute with a per-token metric is Token-DiFR (Karvonen, Rinberg et al., 2025); the two-regime rule in `--replay` (strict when logits hashes match, tolerant otherwise) and the hash-derived draws are this tool's variant of it. Commit-and-open verification of a forward pass at layer granularity is "Lightweight Cryptographic Proofs of Inference" (Anchuri, Campanelli, Gennaro et al., SaTML 2026); this is the same shape at GGML node granularity on the engine's real kernels, with every edge of the graph bound and the inputs regenerated from the receipt.
