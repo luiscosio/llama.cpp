@@ -20,13 +20,16 @@ cmake --build build --target llama-receipts -j
     --temp 0.7 --top-k 40 --top-p 0.95 --trace --openings 32 --out receipt.json
 
 # verify the trace without running the model
-python3 examples/receipts/verify_trace.py receipt.json --model model.gguf
+python3 examples/receipts/verify_trace.py receipt.json --model model.gguf \
+    --expected-topology-sha256 TRUSTED_TOPOLOGY_SHA256
 
 # verify by replay instead (re-runs the model; exit code 0 on accept)
 ./build/bin/llama-receipts -m model.gguf --replay receipt.json
 ```
 
 `--trace` writes `receipt.trace.json` next to the receipt. Prompts must fit in one batch (`-b`), because the tracer counts one graph per decode call. `--challenge-seed HEX` derives the openings from a seed the verifier supplied instead of from the root alone; the verifier then passes the same `--challenge-seed`. `--claim-model other.gguf` is a test aid: the receipt and leaves describe another model while this one runs, which is how the "cheaper quantization served" rejection below was produced.
+
+The verifier requires a topology digest pinned by the verifier from a separately trusted reference run for the same model, engine build, backend settings, prompt length and response length. The receipt records this digest for discovery, but copying it from the receipt being checked is not a security check. This external policy prevents a prover from submitting a smaller, locally consistent graph that skips model layers. The verifier also requires at least 32 openings by default; `--min-openings` changes that verifier-side policy.
 
 The receipt is not signed by this tool. Sign the file with your own key tooling, for example:
 
@@ -73,13 +76,14 @@ The challenge is `k` distinct indices derived from `SHA-256(domain || root || to
 
 Cheapest first. Everything before the openings needs no tensor bytes.
 
-1. Root: the leaves hash to the committed root; leaf and graph counts match.
-2. Challenge: the openings are exactly the sampled indices.
-3. Structure: the graph count fits the token sequence.
-4. Inputs: each graph's token and position inputs hash to what the claimed prompt and response say, and the output row selection is as expected. KV cell indices (either cache layout) and the causal mask are regenerated and reported too.
-5. Edges: every data input's hash equals the output hash of its producer leaf, which comes earlier; the KV cache starts as zeros.
-6. Logits: each graph's final logits hash equals the receipt's per-token logits hash, so the trace and the sampler evidence describe the same run.
-7. Openings: each sits in the tree, its bytes hash to the leaf, its weights match the verifier's own per-tensor hashes of the GGUF by name, type, shape and hash, and re-executing the op in numpy reproduces the output.
+1. Root and content: the leaves hash to the committed root; leaf and graph counts match; token and human-readable text commitments recompute.
+2. Topology: the hash-free graph structure matches the verifier's pinned topology digest.
+3. Challenge: the openings are exactly the sampled indices and meet the verifier's minimum count.
+4. Structure: graph and node indices are contiguous and the graph count fits the token sequence.
+5. Inputs: each graph's token and position inputs hash to what the claimed prompt and response say, and the output row selection is as expected. KV cell indices, the causal mask and every other graph input must be classified and match.
+6. Edges: every data input's hash equals the output hash of its producer leaf, which comes earlier; only named cache tensors may use zeroed persistent state.
+7. Logits: there is one well-formed per-token record per response token, and every sampled token's graph binds to that record's logits hash.
+8. Openings: each sits in the tree, its bytes hash to the leaf, its weights match the verifier's own per-tensor hashes of the GGUF by name, type, shape and hash, and re-executing the op in numpy reproduces the output.
 
 Re-execution compares `max|out - ref| / max|ref|` against a per-op limit; CONT and SET_ROWS are compared bit for bit. Matmuls are judged against three references and take the closest: dequantized weight times float32 activation (Metal decode kernels), both operands rounded to half (Metal prefill kernels), and ggml's CPU path for Q4_K and Q6_K weights, where the activation row is quantized to Q8_K and the dot product is integer. That integer path is reproduced exactly, following `quantize_row_q8_K_ref` and `ggml_vec_dot_q4_K_q8_K`. Weights with more than 16,384 output rows (the vocabulary projection) are checked on a challenge-chosen sample of 2,048 rows.
 

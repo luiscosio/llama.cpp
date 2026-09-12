@@ -2,17 +2,22 @@
 """Verify the activation trace of a llama-receipts receipt without running the model.
 
 Usage:
-    python3 examples/receipts/verify_trace.py receipt.json --model model.gguf [--trace receipt.trace.json] [--report out.json]
+    python3 examples/receipts/verify_trace.py receipt.json --model model.gguf \
+        --expected-topology-sha256 HASH [--trace receipt.trace.json] [--report out.json]
 
 Checks, cheapest first:
-1. the leaves hash to the root the receipt commits to; leaf and graph counts match;
-2. the openings are exactly the Fiat-Shamir sample the root and receipt imply;
-3. the graph count fits the token sequence, every graph's token and position inputs hash
+1. the receipt and trace carry the format version this verifier reads; the leaves hash to the
+   root the receipt commits to; leaf and graph counts match;
+2. the graph topology matches a verifier-supplied digest;
+3. token arrays and displayed text match their commitments;
+4. the openings are exactly the Fiat-Shamir sample the root and receipt imply and meet
+   the verifier's minimum count;
+5. the graph count fits the token sequence, every graph's token and position inputs hash
    to what the claimed prompt and response say, and the output-row selection is as expected;
-4. every data edge is consistent: an input's base hash equals the output hash of the leaf
+6. every data edge is consistent: an input's base hash equals the output hash of the leaf
    recorded as its producer, and the KV cache starts as zeros;
-5. each graph that produces one logits row binds it to the receipt's per-token logits hash;
-6. each opening sits in the tree, its bytes hash to the leaf, its weight inputs match this
+7. each graph that produces one logits row binds it to the receipt's per-token logits hash;
+8. each opening sits in the tree, its bytes hash to the leaf, its weight inputs match this
    verifier's own per-tensor hashes of the GGUF, and re-executing the op in numpy reproduces
    the output within the op's tolerance.
 
@@ -51,6 +56,8 @@ from gguf import GGUFReader, quants  # noqa: E402
 CHALLENGE_DOMAIN = b"llama-receipts/trace-challenge/v1/"
 PRODUCER_INPUT = -1
 PRODUCER_INITIAL = -2
+RECEIPT_VERSION = "0.2"
+TRACE_VERSION = "trace/v2"
 BIG_MATMUL_ROWS = 16384  # weights with more output rows than this are checked on a row sample
 ROWS_CHECKED = 2048
 HARD_INPUTS = ("tokens", "positions", "out_ids")
@@ -69,6 +76,18 @@ def sha256(b: bytes) -> str:
 def canonical_bytes(obj) -> bytes:
     """Same bytes nlohmann::json::dump() produces: sorted keys, no whitespace."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def topology_sha256(leaves: list[dict]) -> str:
+    """Digest graph structure while excluding runtime tensor contents."""
+    def strip_hashes(value):
+        if isinstance(value, dict):
+            return {k: strip_hashes(v) for k, v in value.items() if k != "sha256"}
+        if isinstance(value, list):
+            return [strip_hashes(v) for v in value]
+        return value
+
+    return sha256(canonical_bytes(strip_hashes(leaves)))
 
 
 def _leaf_hash(data: bytes) -> bytes:
@@ -645,7 +664,8 @@ def classify_input(leaf: dict, i: int) -> str | None:
 # the verifier
 # ----------------------------------------------------------------------------------------------
 
-def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes = b"") -> dict:
+def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes = b"", expected_topology_sha256: str | None = None,
+                 min_openings: int = 32) -> dict:
     t0 = time.time()
     checks: dict[str, dict] = {}
     hard_fail: list[str] = []
@@ -658,27 +678,50 @@ def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes =
     tr = rec.get("trace")
     if not tr:
         return {"verdict": "reject", "reason": "receipt carries no trace commitment", "checks": checks}
+    versions = (rec.get("receipt_version"), tr.get("version"), tdoc.get("version"))
+    check("version", versions == (RECEIPT_VERSION, TRACE_VERSION, TRACE_VERSION),
+          f"receipt {versions[0]}, trace {versions[1]} and {versions[2]}; this verifier reads receipt {RECEIPT_VERSION} with {TRACE_VERSION}")
+    if hard_fail:
+        return {"verdict": "reject", "reason": hard_fail[0], "checks": checks}
     leaves = tdoc["leaves"]
     root = merkle_root([canonical_bytes(x) for x in leaves]).hex()
     n_graphs = (max((x["g"] for x in leaves), default=-1) + 1) if leaves else 0
     check("root", root == tr["root"] == tdoc["root"] and len(leaves) == tr["n_leaves"] and n_graphs == tr["n_graphs"],
           f"recomputed {root[:16]} vs committed {tr['root'][:16]}; {len(leaves)} leaves, {n_graphs} graphs")
 
-    binding = bytes.fromhex(rec["commitments"]["tokens_sha256"]) + bytes.fromhex(rec["model"]["file_sha256"])
+    topology = topology_sha256(leaves)
+    recorded_topology = tr.get("topology_sha256")
+    check("topology", expected_topology_sha256 is not None and topology == recorded_topology == tdoc.get("topology_sha256") == expected_topology_sha256,
+          "verifier topology policy missing" if expected_topology_sha256 is None else
+          f"recomputed {topology[:16]} vs expected {expected_topology_sha256[:16]}")
+
+    prompt = rec["request"]["prompt_tokens"]
+    resp = rec["response"]["tokens"]
+    token_commitment = sha256(canonical_bytes({"prompt": prompt, "response": resp}))
+    content_commitment = sha256(canonical_bytes({"prompt_text": rec["request"]["prompt_text"], "response_text": rec["response"]["text"]}))
+    check("content_commitments", token_commitment == rec["commitments"].get("tokens_sha256") and
+          content_commitment == rec["commitments"].get("content_sha256"), "token and human-readable receipt content")
+
+    binding = bytes.fromhex(rec["commitments"]["tokens_sha256"]) + bytes.fromhex(rec["commitments"]["content_sha256"]) + bytes.fromhex(rec["model"]["file_sha256"])
     ch = tdoc.get("challenge", {})
     k = int(ch.get("k", len(tdoc["openings"])))
     seed = bytes.fromhex(ch.get("seed", "") or "")
     expected_idx = derive_indices(tr["root"], binding, len(leaves), k, seed)
     got_idx = sorted(o["index"] for o in tdoc["openings"])
+    required_openings = min(max(min_openings, 1), len(leaves))
     if challenge_seed and seed != challenge_seed:
         check("challenge", False, "the recorded challenge seed is not the one this verifier issued")
     else:
-        check("challenge", got_idx == expected_idx and len(got_idx) == k,
+        check("challenge", got_idx == expected_idx and len(got_idx) == min(k, len(leaves)) and len(got_idx) >= required_openings,
               f"{len(got_idx)} openings, expected {len(expected_idx)}" + ("" if got_idx == expected_idx else ", indices differ")
-              + (", interactive seed" if seed else ", Fiat-Shamir"))
+              + f", policy minimum {required_openings}" + (", interactive seed" if seed else ", Fiat-Shamir"))
 
-    resp = rec["response"]["tokens"]
     check("graph_count", len(resp) <= n_graphs <= len(resp) + 1, f"{n_graphs} graphs for {len(resp)} response tokens")
+    graph_positions: dict[int, list[int]] = {}
+    for leaf in leaves:
+        graph_positions.setdefault(leaf["g"], []).append(leaf["i"])
+    graph_order_ok = sorted(graph_positions) == list(range(n_graphs)) and all(pos == list(range(len(pos))) for pos in graph_positions.values())
+    check("graph_order", graph_order_ok, "graph and node indices are contiguous")
 
     zero_hashes: dict[int, str] = {}
     edge_bad = edge_total = unknown_inputs = 0
@@ -699,7 +742,7 @@ def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes =
                 edge_total += 1
                 nb = s["base"]["nbytes"]
                 zero_hashes.setdefault(nb, sha256(bytes(nb)))
-                if zero_hashes[nb] != s["base"]["sha256"]:
+                if not s["base"]["name"].startswith("cache_") or zero_hashes[nb] != s["base"]["sha256"]:
                     edge_bad += 1
             else:
                 kind = classify_input(leaf, i)
@@ -716,24 +759,30 @@ def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes =
     check("edges", edge_bad == 0, f"{edge_bad} of {edge_total} data edges inconsistent")
     for kind in HARD_INPUTS:
         c = inputs[kind]
-        check(f"input_{kind}", c["mismatch"] == 0 and (c["match"] > 0 or kind == "out_ids"), f"{c['match']} match, {c['mismatch']} mismatch")
+        check(f"input_{kind}", c["mismatch"] == 0 and c["match"] > 0, f"{c['match']} match, {c['mismatch']} mismatch")
     for kind in SOFT_INPUTS:
         c = inputs[kind]
         check(f"input_{kind}", c["mismatch"] == 0, f"{c['match']} match, {c['mismatch']} mismatch", hard=False)
-    checks["inputs_unclassified"] = {"ok": True, "detail": f"{unknown_inputs} inputs not classified"}
+    check("inputs_unclassified", unknown_inputs == 0, f"{unknown_inputs} inputs not classified")
 
     per_token = rec["response"]["per_token"]
     bound = bad = 0
-    for g in range(0, min(n_graphs, len(per_token))):
+    records_ok = len(per_token) == len(resp) and all(isinstance(row, dict) and isinstance(row.get("logits_sha256"), str) and row.get("token") == resp[i]
+                                                     and row.get("position") == len(prompt) + i
+                                                     for i, row in enumerate(per_token))
+    check("per_token", records_ok, f"{len(per_token)} records for {len(resp)} response tokens")
+    for g in range(len(resp)):
+        if g >= len(per_token):
+            bad += 1
+            continue
         leaf = last_matmul_by_graph.get(g)
         if leaf is None or leaf["out"]["ne"][1] != 1:
-            if g > 0:
-                bad += 1  # decode graphs always produce exactly one logits row
+            bad += 1
             continue
         bound += 1
-        if leaf["out"]["base"]["sha256"] != per_token[g]["logits_sha256"]:
+        if leaf["out"]["base"]["sha256"] != per_token[g].get("logits_sha256"):
             bad += 1
-    check("logits_binding", bad == 0, f"{bound} graphs bound to receipt logits hashes, {bad} failed")
+    check("logits_binding", bad == 0 and bound == len(resp), f"{bound} graphs bound to {len(resp)} receipt logits hashes, {bad} failed")
 
     t_open = time.time()
     store = WeightStore(model_path)
@@ -848,6 +897,8 @@ def main(argv=None) -> int:
     p.add_argument("--trace", help="sidecar path (default: <receipt without .json>.trace.json)")
     p.add_argument("--report", help="write the full report as JSON")
     p.add_argument("--challenge-seed", default="", help="hex seed this verifier issued; the sidecar must record the same one")
+    p.add_argument("--expected-topology-sha256", required=True, help="trusted topology digest for this model, engine and request shape")
+    p.add_argument("--min-openings", type=int, default=32, help="minimum challenge openings required by verifier policy")
     a = p.parse_args(argv)
     rec = json.loads(Path(a.receipt).read_text())
     tpath = Path(a.trace) if a.trace else Path(a.receipt).with_name(Path(a.receipt).name.removesuffix(".json") + ".trace.json")
@@ -855,7 +906,8 @@ def main(argv=None) -> int:
         print(f"no trace sidecar at {tpath}")
         return 2
     tdoc = json.loads(tpath.read_text())
-    res = verify_trace(rec, tdoc, a.model, challenge_seed=bytes.fromhex(a.challenge_seed))
+    res = verify_trace(rec, tdoc, a.model, challenge_seed=bytes.fromhex(a.challenge_seed),
+                       expected_topology_sha256=a.expected_topology_sha256, min_openings=a.min_openings)
     print(f"verdict: {res['verdict']} ({res['reason']})")
     for name, c in res.get("checks", {}).items():
         print(f"  {name:22s} {'ok ' if c['ok'] else 'BAD'} {c.get('detail', '')}")

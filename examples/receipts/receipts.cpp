@@ -53,8 +53,8 @@ extern "C" {
 
 using json = nlohmann::json; // std::map keys: dump() is canonical (sorted keys, no whitespace)
 
-static const char * RECEIPT_VERSION   = "0.1";
-static const char * TRACE_VERSION     = "trace/v1";
+static const char * RECEIPT_VERSION   = "0.2";
+static const char * TRACE_VERSION     = "trace/v2";
 static const char * SAMPLER_DOMAIN    = "llama-receipts/u/v1/";
 static const char * CHALLENGE_DOMAIN  = "llama-receipts/trace-challenge/v1/";
 static const int    PRODUCER_INPUT    = -1;
@@ -96,6 +96,32 @@ static std::string sha256_hex(const void * p, size_t n) {
 }
 
 static std::string sha256_hex(const std::string & s) { return sha256_hex(s.data(), s.size()); }
+
+static void remove_tensor_hashes(json & value) {
+    if (value.is_array()) {
+        for (auto & item : value) {
+            remove_tensor_hashes(item);
+        }
+        return;
+    }
+    if (!value.is_object()) {
+        return;
+    }
+    for (auto it = value.begin(); it != value.end();) {
+        if (it.key() == "sha256") {
+            it = value.erase(it);
+        } else {
+            remove_tensor_hashes(it.value());
+            ++it;
+        }
+    }
+}
+
+static std::string topology_sha256(const json & leaves) {
+    json topology = leaves;
+    remove_tensor_hashes(topology);
+    return sha256_hex(topology.dump());
+}
 
 static std::string sha256_file(const std::string & path, std::streamoff offset = 0, std::streamoff length = -1) {
     std::ifstream f(path, std::ios::binary);
@@ -722,6 +748,7 @@ struct tracer {
 
     json summary() const {
         return { { "version", TRACE_VERSION }, { "root", root() }, { "n_leaves", leaves.size() }, { "n_graphs", graph + 1 },
+                 { "topology_sha256", topology_sha256(leaves) },
                  { "leaf_hash", "sha256(0x00 || canonical_json(leaf))" },
                  { "layout_ops_resolved", { "PERMUTE", "RESHAPE", "TRANSPOSE", "VIEW" } }, { "stats", stats.to_json() } };
     }
@@ -760,6 +787,7 @@ static std::vector<int> derive_indices(const std::string & root_hex, const std::
 
 static std::string challenge_binding(const json & receipt) {
     return from_hex(receipt.at("commitments").at("tokens_sha256").get<std::string>()) +
+           from_hex(receipt.at("commitments").at("content_sha256").get<std::string>()) +
            from_hex(receipt.at("model").at("file_sha256").get<std::string>());
 }
 
@@ -867,11 +895,13 @@ static json build_receipt(engine & e, const common_params & params, const model_
         text += common_token_to_piece(e.ctx, r.token, true);
     }
     const json commit_doc = { { "prompt", prompt_tokens }, { "response", tokens } };
+    const json request = { { "prompt_text", prompt_text }, { "prompt_tokens", prompt_tokens }, { "sampler", cfg.to_json() }, { "n_predict", n_predict } };
+    const json response = { { "tokens", tokens }, { "text", text }, { "per_token", per_token } };
+    const json content_doc = { { "prompt_text", prompt_text }, { "response_text", text } };
     json doc = {
         { "receipt_version", RECEIPT_VERSION }, { "created_at", iso_now() }, { "engine", engine_info(params) }, { "model", mc.summary() },
-        { "request", { { "prompt_text", prompt_text }, { "prompt_tokens", prompt_tokens }, { "sampler", cfg.to_json() }, { "n_predict", n_predict } } },
-        { "response", { { "tokens", tokens }, { "text", text }, { "per_token", per_token } } },
-        { "commitments", { { "tokens_sha256", sha256_hex(commit_doc.dump()) } } },
+        { "request", request }, { "response", response },
+        { "commitments", { { "tokens_sha256", sha256_hex(commit_doc.dump()) }, { "content_sha256", sha256_hex(content_doc.dump()) } } },
     };
     if (e.tr) {
         if (!e.tr->errors.empty()) {
@@ -919,8 +949,8 @@ static json open_trace(engine & e, const json & doc, const std::vector<llama_tok
         openings.push_back({ { "index", idx }, { "path", mk_path(levels, (size_t) idx) }, { "enc", "base64" },
                              { "out", base64::encode(c->second.out.data(), c->second.out.size()) }, { "srcs", srcs } });
     }
-    return { { "version", TRACE_VERSION }, { "root", root }, { "n_graphs", n_graphs },
-             { "challenge", { { "mode", seed_hex.empty() ? "fiat-shamir" : "interactive" }, { "k", k }, { "indices", indices }, { "seed", seed_hex } } },
+    return { { "version", TRACE_VERSION }, { "root", root }, { "n_graphs", n_graphs }, { "topology_sha256", topology_sha256(e.tr->leaves) },
+             { "challenge", { { "mode", seed_hex.empty() ? "fiat-shamir" : "interactive" }, { "k", indices.size() }, { "indices", indices }, { "seed", seed_hex } } },
              { "stats", e.tr->stats.to_json() }, { "leaves", e.tr->leaves }, { "openings", openings } };
 }
 
@@ -954,9 +984,16 @@ static int cmd_replay(engine & e, const common_params & params, const std::strin
     const std::vector<llama_token> response = rec.at("response").at("tokens").get<std::vector<llama_token>>();
     const json & per_token = rec.at("response").at("per_token");
     const sampler_cfg cfg = sampler_cfg::from_json(rec.at("request").at("sampler"));
+    const json token_doc = { { "prompt", prompt }, { "response", response } };
+    const json content_doc = { { "prompt_text", rec.at("request").at("prompt_text") }, { "response_text", rec.at("response").at("text") } };
+    const bool tokens_commitment_ok = sha256_hex(token_doc.dump()) == rec.at("commitments").at("tokens_sha256").get<std::string>();
+    const bool content_commitment_ok = sha256_hex(content_doc.dump()) == rec.at("commitments").at("content_sha256").get<std::string>();
 
     std::string verdict = "accept", reason;
-    if (!model_ok) {
+    if (!tokens_commitment_ok || !content_commitment_ok) {
+        verdict = "reject";
+        reason = "receipt content commitment mismatch";
+    } else if (!model_ok) {
         verdict = "reject";
         reason = "model hash mismatch";
     } else if (response.empty() || per_token.size() != response.size()) {
@@ -1145,6 +1182,10 @@ int main(int argc, char ** argv) {
     }
     if (ex.replay.empty() && ex.out.empty()) {
         LOG_ERR("--out receipt.json is required when proving\n");
+        return 1;
+    }
+    if (ex.trace && ex.openings <= 0) {
+        LOG_ERR("--openings must be positive\n");
         return 1;
     }
 
