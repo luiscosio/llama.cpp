@@ -36,9 +36,47 @@ structure Leaf where
   canonical : ByteArray   -- sorted-key compact JSON, what the Merkle leaf hashes
   deriving Inhabited
 
-/-- Canonical JSON bytes, the same bytes `json.dumps(sort_keys=True, separators=(",", ":"))`
-    and nlohmann's `dump()` produce for these objects. -/
-def canonicalBytes (j : Json) : ByteArray := j.compress.toUTF8
+/-- JSON string escaping as nlohmann's `dump()` and Python's `json.dumps` do it: `"`, `\` and
+    the five short escapes, `\u00xx` for the other control characters, everything else as raw
+    UTF-8. Lean's own `Json.compress` writes `\u0009` for a tab, `\u0008` for a backspace and
+    `\u000c` for a form feed, which would make the content commitments differ on such text. -/
+def escapeString (s : String) : String :=
+  s.foldl (fun acc c =>
+    if c = '"' then acc ++ "\\\""
+    else if c = '\\' then acc ++ "\\\\"
+    else if c = '\x08' then acc ++ "\\b"
+    else if c = '\x0c' then acc ++ "\\f"
+    else if c = '\n' then acc ++ "\\n"
+    else if c = '\r' then acc ++ "\\r"
+    else if c = '\t' then acc ++ "\\t"
+    else if c.val < 0x20 then
+      acc ++ "\\u00" ++ String.singleton (Sha256.hexDigit (c.toNat / 16)) ++ String.singleton (Sha256.hexDigit (c.toNat % 16))
+    else acc.push c) ""
+
+/-- Canonical JSON text: sorted keys, no whitespace, strings escaped as above. Numbers render
+    as `Json.compress` renders them; the protocol only carries integers. -/
+partial def canonicalString : Json → String
+  | .null => "null"
+  | .bool true => "true"
+  | .bool false => "false"
+  | .num n => (Json.num n).compress
+  | .str s => "\"" ++ escapeString s ++ "\""
+  | .arr xs => "[" ++ ",".intercalate (xs.toList.map canonicalString) ++ "]"
+  | .obj fields =>
+    "{" ++ ",".intercalate (fields.toList.map fun (k, v) => "\"" ++ escapeString k ++ "\":" ++ canonicalString v) ++ "}"
+
+/-- Canonical JSON bytes, the same bytes `json.dumps(sort_keys=True, separators=(",", ":"),
+    ensure_ascii=False)` and nlohmann's `dump()` produce. -/
+def canonicalBytes (j : Json) : ByteArray := (canonicalString j).toUTF8
+
+partial def topologyView : Json → Json
+  | .arr xs => .arr (xs.map topologyView)
+  | .obj fields => Json.mkObj (fields.toList.filterMap fun (key, value) =>
+      if key == "sha256" then none else some (key, topologyView value))
+  | value => value
+
+def topologySha256 (leaves : Array Json) : String :=
+  Sha256.hashHex (canonicalBytes (.arr (leaves.map topologyView)))
 
 def parseSrc (s : Json) : Except String Src := do
   let kind ← s.getObjValAs? String "kind"
@@ -133,8 +171,9 @@ def checkInputs (leaves : Array Leaf) (prompt response : List Int) : InputReport
   return r
 
 /-- The Fiat-Shamir sample the receipt implies. -/
-def challengeIndices (rootHex tokensShaHex modelShaHex seedHex : String) (n k : Nat) : List Nat :=
-  Merkle.deriveIndices Sha256.hash (Sha256.ofHex rootHex) (Sha256.ofHex tokensShaHex ++ Sha256.ofHex modelShaHex)
+def challengeIndices (rootHex tokensShaHex contentShaHex modelShaHex seedHex : String) (n k : Nat) : List Nat :=
+  Merkle.deriveIndices Sha256.hash (Sha256.ofHex rootHex)
+    (Sha256.ofHex tokensShaHex ++ Sha256.ofHex contentShaHex ++ Sha256.ofHex modelShaHex)
     (Sha256.ofHex seedHex) n k
 
 end ReceiptsSpec.Protocol

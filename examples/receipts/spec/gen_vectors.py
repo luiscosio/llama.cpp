@@ -79,8 +79,14 @@ def main(argv=None) -> int:
         dot = (np.einsum("ijl,ijl->ij", q6b, q8b) * scales[r].astype(np.int64)).sum(axis=1)
         out["q6k"].append({"weight": name, "row": r, "blocks_hex": blocks[r].tobytes().hex(),
                            "act_bits": act.view(np.uint32).tolist(), "dot": dot.tolist()})
+    # canonical JSON bytes, so the Lean checker's string escaping is tested against json.dumps
+    texts = ["", "plain ascii", "tab\there", "quote \" backslash \\ slash /", "newline\n cr\r bs\b ff\f",
+             "controls \x01\x1f del \x7f", "ünïcödé 日本語 🚀", "line sep \u2028"]
+    docs = [{"text": t} for t in texts] + [{"b": [1, -2, 0], "a": {"z": None, "y": True, "x": False}, "c": []}, {}, [], "top", -7, 12345678901]
+    out["canonical"] = [{"value": d, "sha256": vt.sha256(vt.canonical_bytes(d))} for d in docs]
     Path(a.out).write_text(json.dumps(out))
-    print(f"wrote {a.out}: {len(out['q4k'])} q4_K rows of {out['q4k'][0]['weight']}, {len(out['q6k'])} q6_K rows of {out['q6k'][0]['weight']}")
+    print(f"wrote {a.out}: {len(out['q4k'])} q4_K rows of {out['q4k'][0]['weight']}, {len(out['q6k'])} q6_K rows of {out['q6k'][0]['weight']}, "
+          f"{len(out['canonical'])} canonical json documents")
     return 0
 
 

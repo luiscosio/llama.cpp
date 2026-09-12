@@ -47,17 +47,19 @@ Not proved here, stated as the target: the sampling bound. If the verifier accep
 ```bash
 lake build
 ./.lake/build/bin/spec-check sha256                                 # FIPS test vectors
-./.lake/build/bin/spec-check trace receipt.json receipt.trace.json  # root, challenge, edges, inputs of a real trace
+./.lake/build/bin/spec-check trace receipt.json receipt.trace.json TRUSTED_TOPOLOGY_SHA256
 python3 gen_vectors.py receipt.json --model model.gguf --out vectors.json
 ./.lake/build/bin/spec-check vectors vectors.json                  # Q8_K quants, scales, s1, s2, dot, row value
 ```
 
-On a receipt from `llama-receipts` (qwen2.5 1.5B Q4_K_M, CPU, 12 tokens, 24 openings, Sep 11, 2026):
+The topology digest must come from a separately trusted reference run for the same model, engine settings and request shape. On a receipt from `llama-receipts` (qwen2.5 1.5B Q4_K_M, CPU, 12 tokens, 32 openings, Sep 11, 2026):
 
 | Check | Result |
 |---|---|
 | Merkle root over 8,086 canonical leaves | equals the receipt's committed root |
-| Fiat-Shamir sample | equals the 24 opened indices |
+| Topology | equals the verifier's pinned digest |
+| Content commitments | token arrays and displayed text recompute |
+| Fiat-Shamir sample | equals the 32 opened indices and meets policy |
 | Data edges | 0 of 10,621 inconsistent |
 | Token inputs, position inputs | 13 of 13 and 728 of 728 match the receipt's tokens |
 | Q4_K rows: Q8_K quants, `d` bit patterns, `s1`, `s2` | all equal to the Python verifier's |
