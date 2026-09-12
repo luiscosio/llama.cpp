@@ -7,10 +7,12 @@
 //!     s1[m,i] = sum_{j<8} sc[m,i,j] * sum_{l<32} q4[m,i,32j+l] * q8[i,32j+l]
 //!     s2[m,i] = sum_{j<16} bsums[i,j] * mn[m,i,j/2],   bsums[i,j] = sum_{l<16} q8[i,16j+l]
 //!
-//! q4 (0..15), sc and mn (0..63) are the weight's integers and are private inputs; q8
-//! (-127..127) and the per-block sums s1, s2 are public. The verifier of a receipt
-//! applies the per-block float scales to s1 and s2 itself (see zk_node.py), which is
-//! the cheap part; the integer core is what the proof covers.
+//! q4 (0..15), sc and mn (0..63) are the weight's integers, q8 (-127..127) is the quantized
+//! activation and s1, s2 are the per-block sums. All of them are public inputs: the verifier
+//! checks the weight values against its own GGUF before accepting a proof, checks every range
+//! and bound below before converting to the field, and applies the per-block float scales to
+//! s1 and s2 itself (see zk_node.py), which is the cheap part. The integer core is what the
+//! proof covers.
 //!
 //! Integers live in the Mersenne-31 field. Every per-block sum is bounded by
 //! 256 * 127 * 945 < 2^25, far from the modulus, so field arithmetic equals integer
@@ -32,13 +34,17 @@ use serde::{Deserialize, Serialize};
 use serdes::ExpSerde;
 
 const QK_K: usize = 256;
+const M31_MODULUS: u64 = 2_147_483_647;
+const S1_ABS_BOUND: u64 = 8 * 32 * 15 * 127 * 63;
+const S2_ABS_BOUND: u64 = 16 * 16 * 127 * 63;
 
 declare_circuit!(QDot {
     m: usize,
     k: usize,
-    q4: [Variable],       // m * k nibbles
-    sc: [Variable],       // m * nb * 8
-    mn: [Variable],       // m * nb * 8
+    dummy: [Variable],    // Expander requires a nontrivial private-input layer
+    q4: [PublicVariable], // m * k nibbles
+    sc: [PublicVariable], // m * nb * 8
+    mn: [PublicVariable], // m * nb * 8
     q8: [PublicVariable], // k
     s1: [PublicVariable], // m * nb
     s2: [PublicVariable], // m * nb
@@ -61,6 +67,10 @@ fn sum_tree<C: Config, B: RootAPI<C>>(api: &mut B, mut xs: Vec<Variable>) -> Var
 impl<C: Config> Define<C> for QDot<Variable> {
     fn define<B: RootAPI<C>>(&self, api: &mut B) {
         let (m, k) = (self.m, self.k);
+        for value in self.dummy.iter() {
+            let zero = api.constant(0);
+            api.assert_is_equal(*value, zero);
+        }
         let nb = k / QK_K;
         // group sums of the activation, shared by every output row
         let mut bsums = Vec::with_capacity(nb * 16);
@@ -110,13 +120,16 @@ struct PublicFile {
     m: usize,
     k: usize,
     config: String,
+    q4: Vec<u8>,
+    sc: Vec<u8>,
+    mn: Vec<u8>,
     q8: Vec<i32>,
     s1: Vec<i64>,
     s2: Vec<i64>,
 }
 
 fn fe<C: Config>(x: i64) -> CircuitField<C> {
-    assert!(x.unsigned_abs() < (1u64 << 31), "value {} does not fit the field headroom", x);
+    assert!(x.unsigned_abs() < M31_MODULUS, "value {} is not a canonical M31 integer", x);
     let mag = CircuitField::<C>::from(x.unsigned_abs() as u32);
     if x < 0 {
         CircuitField::<C>::zero() - mag
@@ -130,6 +143,7 @@ fn shape_circuit(m: usize, k: usize) -> QDot<Variable> {
     QDot {
         m,
         k,
+        dummy: vec![Variable::default(); 16],
         q4: vec![Variable::default(); m * k],
         sc: vec![Variable::default(); m * nb * 8],
         mn: vec![Variable::default(); m * nb * 8],
@@ -139,14 +153,14 @@ fn shape_circuit(m: usize, k: usize) -> QDot<Variable> {
     }
 }
 
-fn assignment<C: Config>(w: &WitnessFile, zero_private: bool) -> QDot<CircuitField<C>> {
-    let z = |v: i64| if zero_private { CircuitField::<C>::zero() } else { fe::<C>(v) };
+fn assignment<C: Config>(w: &WitnessFile) -> QDot<CircuitField<C>> {
     QDot {
         m: w.m,
         k: w.k,
-        q4: w.q4.iter().map(|&x| z(x as i64)).collect(),
-        sc: w.sc.iter().map(|&x| z(x as i64)).collect(),
-        mn: w.mn.iter().map(|&x| z(x as i64)).collect(),
+        dummy: vec![CircuitField::<C>::zero(); 16],
+        q4: w.q4.iter().map(|&x| fe::<C>(x as i64)).collect(),
+        sc: w.sc.iter().map(|&x| fe::<C>(x as i64)).collect(),
+        mn: w.mn.iter().map(|&x| fe::<C>(x as i64)).collect(),
         q8: w.q8.iter().map(|&x| fe::<C>(x as i64)).collect(),
         s1: w.s1.iter().map(|&x| fe::<C>(x)).collect(),
         s2: w.s2.iter().map(|&x| fe::<C>(x)).collect(),
@@ -164,10 +178,21 @@ fn check_shape(w: &WitnessFile) {
     assert_eq!(w.s2.len(), w.m * nb);
 }
 
+fn check_values(w: &WitnessFile) {
+    assert!(w.q4.iter().all(|&x| x < 16), "q4 values must be in 0..15");
+    assert!(w.sc.iter().all(|&x| x < 64), "Q4_K scales must be in 0..63");
+    assert!(w.mn.iter().all(|&x| x < 64), "Q4_K mins must be in 0..63");
+    assert!(w.q8.iter().all(|&x| (-127..=127).contains(&x)), "q8 values must be in -127..127");
+    assert!(w.s1.iter().all(|&x| x.unsigned_abs() <= S1_ABS_BOUND), "s1 exceeds the proven integer bound");
+    assert!(w.s2.iter().all(|&x| x.unsigned_abs() <= S2_ABS_BOUND), "s2 exceeds the proven integer bound");
+}
+
 fn prove<C: Config>(w: &WitnessFile, out_dir: &Path, config_name: &str) {
     check_shape(w);
+    check_values(w);
     let nb = w.k / QK_K;
-    eprintln!("circuit: m={} k={} blocks={} private inputs={} public inputs={}", w.m, w.k, nb, w.m * w.k + 2 * w.m * nb * 8, w.k + 2 * w.m * nb);
+    eprintln!("circuit: m={} k={} blocks={} public inputs={}", w.m, w.k, nb,
+              w.m * w.k + 2 * w.m * nb * 8 + w.k + 2 * w.m * nb);
 
     let t = Instant::now();
     let compiled: CompileResult<C> = compile(&shape_circuit(w.m, w.k), CompileOptions::default()).expect("compile");
@@ -176,7 +201,7 @@ fn prove<C: Config>(w: &WitnessFile, out_dir: &Path, config_name: &str) {
 
     let t = Instant::now();
     let n_pack = SIMDField::<C>::PACK_SIZE;
-    let assign = assignment::<C>(w, false);
+    let assign = assignment::<C>(w);
     let assigns = vec![assign; n_pack];
     let witness = compiled.witness_solver.solve_witnesses(&assigns).expect("witness");
     let ok = compiled.layered_circuit.run(&witness);
@@ -198,7 +223,8 @@ fn prove<C: Config>(w: &WitnessFile, out_dir: &Path, config_name: &str) {
     proof.serialize_into(&mut bytes).expect("proof");
     claimed_v.serialize_into(&mut bytes).expect("claimed value");
     fs::write(out_dir.join("proof.bin"), &bytes).expect("write proof");
-    let public = PublicFile { m: w.m, k: w.k, config: config_name.to_string(), q8: w.q8.clone(), s1: w.s1.clone(), s2: w.s2.clone() };
+    let public = PublicFile { m: w.m, k: w.k, config: config_name.to_string(), q4: w.q4.clone(), sc: w.sc.clone(), mn: w.mn.clone(),
+                              q8: w.q8.clone(), s1: w.s1.clone(), s2: w.s2.clone() };
     serde_json::to_writer(BufWriter::new(fs::File::create(out_dir.join("public.json")).unwrap()), &public).expect("public");
     eprintln!("proved in {:.2}s: proof {} bytes, layers {}", prove_s, bytes.len(), n_layers);
     println!("{{\"prove_seconds\":{:.3},\"proof_bytes\":{},\"layers\":{},\"config\":\"{}\"}}", prove_s, bytes.len(), n_layers, config_name);
@@ -209,12 +235,11 @@ fn verify<C: Config>(p: &PublicFile, proof_path: &Path, config_name: &str) -> bo
     let compiled: CompileResult<C> = compile(&shape_circuit(p.m, p.k), CompileOptions::default()).expect("compile");
     let compile_s = t.elapsed().as_secs_f64();
 
-    // The verifier knows only the public inputs. Private inputs are set to zero: with the
-    // Orion commitment the proof carries what the verifier needs about them; with the raw
-    // "commitment" it does not, and verification of a real proof is expected to fail.
-    let w = WitnessFile { m: p.m, k: p.k, q4: vec![0; p.m * p.k], sc: vec![0; p.m * (p.k / QK_K) * 8], mn: vec![0; p.m * (p.k / QK_K) * 8], q8: p.q8.clone(), s1: p.s1.clone(), s2: p.s2.clone() };
+    let w = WitnessFile { m: p.m, k: p.k, q4: p.q4.clone(), sc: p.sc.clone(), mn: p.mn.clone(), q8: p.q8.clone(), s1: p.s1.clone(), s2: p.s2.clone() };
+    check_shape(&w);
+    check_values(&w);
     let n_pack = SIMDField::<C>::PACK_SIZE;
-    let assigns = vec![assignment::<C>(&w, true); n_pack];
+    let assigns = vec![assignment::<C>(&w); n_pack];
     let witness = compiled.witness_solver.solve_witnesses(&assigns).expect("witness shape");
     let mut circuit = compiled.layered_circuit.export_to_expander_flatten();
     let (simd_input, simd_public) = witness.to_simd();

@@ -11,7 +11,9 @@ s1[m,i] = Σ_{j<8}  sc[m,i,j] · Σ_{l<32} q4[m,i,32j+l] · q8[i,32j+l]
 s2[m,i] = Σ_{j<16} bsums[i,j] · mn[m,i,j/2]        bsums[i,j] = Σ_{l<16} q8[i,16j+l]
 ```
 
-The weight's nibbles `q4` (0..15), sub-block scales `sc` and mins `mn` (0..63) are private inputs, committed by the proof. The activation quants `q8` (−127..127) and the per-block sums `s1`, `s2` are public. The verifier of a receipt then applies the per-block float scales itself, `Σ_i d_a[i]·(d[m,i]·s1[m,i] − dmin[m,i]·s2[m,i])`, a few thousand multiply-adds, and compares with the node's opened output. The integer core, millions of multiplications, is what the proof covers.
+The weight's nibbles `q4` (0..15), sub-block scales `sc` and mins `mn` (0..63), activation quants `q8` (-127..127), and per-block sums `s1`, `s2` are public inputs. `zk_node.py` derives the weight inputs from the verifier's GGUF and refuses a public input file that differs. The verifier then applies the per-block float scales itself, `sum_i d_a[i] * (d[m,i] * s1[m,i] - dmin[m,i] * s2[m,i])`, and compares with the node's opened output. The integer core, millions of multiplications, is what the proof covers.
+
+Making the weights public is deliberate. The earlier private-input version committed to some witness but did not bind that commitment to the claimed GGUF tensor. A future private version needs an in-circuit or externally verifiable commitment tied to the model. Until then, this proof provides arithmetic integrity but no weight privacy.
 
 Every per-block sum is below 2^25 in magnitude (proved in `../spec`, `s1_lt_2_pow_25` and `s2_bound`), so arithmetic in the M31 field equals integer arithmetic and negatives are read back as `p − |x|`.
 
@@ -26,30 +28,31 @@ cargo build --release
 # prove and verify a node from a receipt's trace, then check the float step against the opened output
 python3 zk_node.py receipt.json --model model.gguf --out zk-out            # first decode-graph Q4_K matmul
 python3 zk_node.py receipt.json --model model.gguf --index 779 --out zk-out # a specific opened leaf
+python3 zk_node.py receipt.json --model model.gguf --index 779 --out zk-out --verify-only # independently verify existing files
 ```
 
-`zk_node.py` reads the opening's bytes and the verifier's GGUF, quantizes the activation to `Q8_K` with the same code the verifier uses, writes `witness.json`, runs `receipts-zk prove`, runs `receipts-zk verify` with the private inputs zeroed, verifies a tampered public sum is rejected, and applies the float step. Receipts must come from the CPU backend for the integer statement to describe the kernel that ran; Metal's kernels use float32 activations.
+`zk_node.py` reads the opening's bytes and the verifier's GGUF, quantizes the activation to `Q8_K` with the same code the verifier uses, writes `witness.json`, runs `receipts-zk prove`, checks every proof public input against the independently derived value, runs `receipts-zk verify`, verifies a tampered public sum is rejected, and applies the float step. `--verify-only` skips proof creation and performs those checks on an existing proof directory. Receipts must come from the CPU backend for the integer statement to describe the kernel that ran; Metal's kernels use float32 activations.
 
-Two configurations. `orion` (default) commits to the private inputs with a hash-based polynomial commitment; the verifier never sees the weights. `raw` ships the witness inside the proof; it verifies, but it hides nothing and the proof is twice as large.
+The `orion` and `raw` options remain available as Expander configurations, but neither hides model weights in this circuit because the weights are public statement values.
 
 ## Results
 
-Apple M5, qwen2.5 1.5B Q4_K_M, one activation row from a CPU trace, Orion commitment (Sep 11, 2026):
+Apple M5, qwen2.5 1.5B Q4_K_M, one activation row from a CPU trace, public weights (Sep 11, 2026):
 
-| Node | Weight | Private inputs | Compile | Witness | Prove | Proof | Verify | Float step error | Tampered sum |
+| Node | Weight | Public inputs | Compile | Witness | Prove | Proof | Verify | Float step error | Tampered sum |
 |---|---|---|---|---|---|---|---|---|---|
-| `Kcur-0`, 256 x 1536 | `blk.0.attn_k.weight` | 417,792 | 1.7 s | 0.05 s | 0.28 s | 6.5 MB | 0.08 s | 2.7e-7 | rejected |
-| `Qcur-7`, 1536 x 1536 | `blk.7.attn_q.weight` | 2,506,752 | 15.2 s | 0.45 s | 2.5 s | 16.0 MB | 0.40 s | 1.8e-7 | rejected |
+| `Kcur-13`, 256 x 1536 | `blk.13.attn_k.weight` | 422,400 | 2.3 s | 0.03 s | 0.19 s | 27.9 MB | 0.20 s | 2.0e-7 | rejected |
 
-The circuit has four layers. Verification recompiles the circuit from its shape, which is the 1.7 s and 15 s in the compile column; caching the compiled circuit per shape would remove that. Expander packs 16 SIMD lanes, so the prover proves 16 identical copies of the witness; batching 16 different rows or nodes into those lanes is free throughput left on the table. With the `raw` configuration the `Kcur-0` proof is 34 MB.
+The circuit has four layers. Verification recompiles the circuit from its shape; caching the compiled circuit per shape would remove that cost. Expander packs 16 SIMD lanes, so batching 16 different rows or nodes into those lanes is free throughput left on the table.
 
 ## What this establishes
 
 - llama.cpp's native block-quantized arithmetic can be stated as a circuit without dequantizing to float, and proven with an existing GKR prover in seconds for one node.
-- The proof slots into the receipt design unchanged: the opening's bytes become the witness, the leaf's committed hashes bind the public inputs, and the verifier's remaining work is the float step.
+- The proof binds all quantized weight values as public inputs; the verifier checks them against the claimed GGUF before accepting the proof.
+- Prover and verifier check the Q4_K and Q8_K ranges and the sum bounds on every public input before field conversion, so a value that would alias in Mersenne-31 is refused rather than proven.
 - The sums the circuit outputs are exactly the ones the Lean spec defines and bounds.
 
-Not yet: the other ops of a layer, proving every matmul of a token instead of one node, batching, a GPU prover, and publishing the weight commitment once per model so the verifier does not need the GGUF. The per-node circuit is also the natural unit for a proof that the circuit matches the Lean spec.
+Not yet: private weights under a model-bound commitment, the other ops of a layer, proving every matmul of a token instead of one node, batching, a GPU prover, and publishing a commitment once per model so the verifier does not need the GGUF. The per-node circuit is also the natural unit for a proof that the circuit matches the Lean spec.
 
 ## Dependencies and licence
 

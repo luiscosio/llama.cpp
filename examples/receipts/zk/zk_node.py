@@ -6,9 +6,9 @@
 Picks a MUL_MAT opening whose weight is Q4_K (the first decode-graph one unless --index
 is given), extracts the witness from the opened bytes and the verifier's own GGUF:
 
-    q4, sc, mn   the weight's nibbles, sub-block scales and mins (private inputs)
-    q8           the activation row quantized to Q8_K exactly as ggml does (public)
-    s1, s2       the per-block integer sums the circuit must reproduce (public)
+    q4, sc, mn   the weight's nibbles, sub-block scales and mins (public, checked from the GGUF)
+    q8           the activation row quantized to Q8_K exactly as ggml does
+    s1, s2       the per-block integer sums the circuit must reproduce
 
 then runs `receipts-zk prove`, `receipts-zk verify`, and finally applies the per-block
 float scales to s1 and s2 the way ggml's kernel does and compares with the node's
@@ -73,6 +73,7 @@ def main(argv=None) -> int:
     p.add_argument("--config", default="orion", choices=["orion", "raw"])
     p.add_argument("--out", default="zk-out")
     p.add_argument("--binary", default=str(HERE / "target" / "release" / "receipts-zk"))
+    p.add_argument("--verify-only", action="store_true", help="verify an existing public.json and proof.bin without creating a proof")
     a = p.parse_args(argv)
 
     rec = json.loads(Path(a.receipt).read_text())
@@ -109,22 +110,30 @@ def main(argv=None) -> int:
                "mn": mn.reshape(-1).astype(int).tolist(), "q8": q8.tolist(), "s1": s1.reshape(-1).tolist(), "s2": s2.reshape(-1).tolist()}
     outdir = Path(a.out)
     outdir.mkdir(parents=True, exist_ok=True)
-    (outdir / "witness.json").write_text(json.dumps(witness))
-    print(f"witness: {M * K} nibbles, {M * nb * 8} scales, {M * nb * 8} mins private; {K} activations, {2 * M * nb} sums public")
+    print(f"statement: {M * K} nibbles, {M * nb * 8} scales, {M * nb * 8} mins, {K} activations, {2 * M * nb} sums public")
 
     # the float step the receipt verifier performs itself, as ggml's kernel does after the integer core
     ref = (d_a[0][None, :] * d_w * s1 - d_a[0][None, :] * dmin * s2).sum(axis=1)
     err = vt.normalized_error(out[0], ref)
     print(f"float step: max|out - ref| / max|ref| = {err:.2e} against the opened output")
 
-    t = time.time()
-    r = subprocess.run([a.binary, "prove", str(outdir / "witness.json"), str(outdir), a.config], capture_output=True, text=True)
-    print(r.stderr.strip())
-    if r.returncode != 0:
-        print("prove failed", r.stdout)
-        return 1
-    prove_stats = json.loads(r.stdout.strip().splitlines()[-1])
-    t_prove = time.time() - t
+    prove_stats = None
+    t_prove = 0.0
+    if not a.verify_only:
+        (outdir / "witness.json").write_text(json.dumps(witness))
+        t = time.time()
+        r = subprocess.run([a.binary, "prove", str(outdir / "witness.json"), str(outdir), a.config], capture_output=True, text=True)
+        print(r.stderr.strip())
+        if r.returncode != 0:
+            print("prove failed", r.stdout)
+            return 1
+        prove_stats = json.loads(r.stdout.strip().splitlines()[-1])
+        t_prove = time.time() - t
+
+    public = json.loads((outdir / "public.json").read_text())
+    for key in ("q4", "sc", "mn", "q8", "s1", "s2"):
+        if public[key] != witness[key]:
+            raise RuntimeError(f"proof public input {key} differs from the value derived from the GGUF and trace")
 
     t = time.time()
     v = subprocess.run([a.binary, "verify", str(outdir / "public.json"), str(outdir / "proof.bin"), a.config], capture_output=True, text=True)
