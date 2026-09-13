@@ -120,9 +120,14 @@ qwen2.5 1.5B Q4_K_M, 8 to 12 tokens, 16 to 32 openings, verifier in trace-only m
 
 A larger matrix on the same design, run with a Python prototype of this tracer on the same kernels, is in the author's notes: 28 of 28 verdicts correct on seven cases, plus one case that documents the sampling bound below.
 
+## Proof of one node
+
+`zk/` proves the integer core of one opened matmul node with Expander (GKR over Mersenne-31). The weight nibbles, scales and mins are private inputs bound to a commitment registered once per tensor from the GGUF (`receipts-zk commit`); the verifier holds no weights and refuses a proof whose commitment differs. The activation quants and the per-block sums are public and range-checked before field conversion, and the receipt verifier applies the float scales itself. Not zero-knowledge yet: the commitment binds but does not hide, and the GKR has no masking. See `zk/README.md`.
+
 ## Limits
 
 - **Sampling bound.** A cheat confined to one node with consistent edges is caught only if that node or a consumer is sampled: with `k` openings over `N` leaves the miss probability is about `1 - (1 + consumers) k / N`. Dense cheats (wrong weights, wrong model, wrong arithmetic everywhere) are what the trace is built for; a targeted single-node fabrication needs full replay or a proof system.
+- **Topology policy.** A verifier must provision the expected topology digest independently. The digest is request-shape-specific; accepting the value from the receipt under review removes this protection.
 - **Sampler tampering is out of scope for the trace.** Temperature, greedy or seed tampering leave every activation honest. The trace ties its logits to the receipt; `--replay` judges the sampler.
 - **The verifier holds the weights.** It needs the GGUF to bind weights and re-execute matmuls. Not zero-knowledge.
 - **Cost.** Observing every node splits the graph into single-node dispatches with a sync each. Tracing a 12-token generation of this 1.5B model takes about 3 seconds per pass on Metal; hashing the model file once is another 4 seconds. Trace verification takes 2 to 3 seconds and is dominated by dequantizing the opened weights; at this model size a replay is cheaper. The trace verifier's cost is fixed by `k`, replay grows with the model.

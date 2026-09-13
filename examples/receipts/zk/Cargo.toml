@@ -1,0 +1,55 @@
+[package]
+name = "receipts-zk"
+version = "0.1.0"
+edition = "2021"
+description = "Proof of concept: a GKR proof (Expander) of one traced llama.cpp matmul node in ggml's native Q4_K x Q8_K integer arithmetic"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "receipts-zk"
+path = "src/main.rs"
+
+[dependencies]
+# Circuit frontend and layered-circuit compiler (AGPL-3.0). Pinned to a revision.
+expander_compiler = { git = "https://github.com/PolyhedraZK/ExpanderCompilerCollection", rev = "b5a94702d0fc3304f117d0cdba307517b8b3f6b8" }
+# Prover crates. These must use the same git source as expander_compiler's own workspace, or two copies of the types exist.
+expander_binary = { git = "https://github.com/PolyhedraZK/Expander", branch = "main", package = "bin" }
+gkr_engine = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
+arith = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
+serdes = { git = "https://github.com/PolyhedraZK/Expander", branch = "main", package = "serdes" }
+poly_commit = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
+polynomials = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+debug = false
+
+# Expander's circuit crate calls madvise(MADV_HUGEPAGE), which exists only on Linux. The fork
+# guards that one call with cfg(target_os = "linux"). Every Expander crate is taken from the
+# same fork revision so that only one copy of each type exists in the dependency graph.
+[patch."https://github.com/PolyhedraZK/Expander"]
+arith = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "arith" }
+babybear = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "babybear" }
+bin = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "bin" }
+circuit = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "circuit" }
+config_macros = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "config_macros" }
+crosslayer_prototype = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "crosslayer_prototype" }
+gf2 = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "gf2" }
+gf2_128 = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "gf2_128" }
+gkr = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "gkr" }
+gkr_engine = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "gkr_engine" }
+gkr_hashers = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "gkr_hashers" }
+goldilocks = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "goldilocks" }
+mersenne31 = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "mersenne31" }
+msm_cuda = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "msm_cuda" }
+poly_commit = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "poly_commit" }
+polynomials = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "polynomials" }
+serdes = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "serdes" }
+serdes_derive = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "serdes_derive" }
+sumcheck = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "sumcheck" }
+transcript = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "transcript" }
+tree = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "tree" }
+utils = { git = "https://github.com/luiscosio/Expander", branch = "macos-build", package = "utils" }
