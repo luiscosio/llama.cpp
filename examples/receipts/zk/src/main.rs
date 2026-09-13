@@ -7,19 +7,24 @@
 //!     s1[m,i] = sum_{j<8} sc[m,i,j] * sum_{l<32} q4[m,i,32j+l] * q8[i,32j+l]
 //!     s2[m,i] = sum_{j<16} bsums[i,j] * mn[m,i,j/2],   bsums[i,j] = sum_{l<16} q8[i,16j+l]
 //!
-//! q4 (0..15), sc and mn (0..63) are the weight's integers, q8 (-127..127) is the quantized
-//! activation and s1, s2 are the per-block sums. All of them are public inputs: the verifier
-//! checks the weight values against its own GGUF before accepting a proof, checks every range
-//! and bound below before converting to the field, and applies the per-block float scales to
-//! s1 and s2 itself (see zk_node.py), which is the cheap part. The integer core is what the
-//! proof covers.
+//! q4 (0..15), sc and mn (0..63) are the weight's integers and are private inputs. The proof
+//! carries Expander's polynomial commitment to that private input layer, and the verifier
+//! compares it with a commitment registered once for the tensor (`receipts-zk commit`), so a
+//! proof made with other weights is refused before any sumcheck runs. q8 (-127..127) and the
+//! per-block sums s1, s2 are public; the verifier checks their ranges and bounds before
+//! converting to the field and applies the per-block float scales to s1 and s2 itself (see
+//! zk_node.py), which is the cheap part. The integer core is what the proof covers.
+//!
+//! The commitment binds but does not hide (Orion is a hash-based commitment without blinding)
+//! and Expander's GKR has no zero-knowledge masking, so this is not yet a zero-knowledge proof.
 //!
 //! Integers live in the Mersenne-31 field. Every per-block sum is bounded by
 //! 256 * 127 * 945 < 2^25, far from the modulus, so field arithmetic equals integer
 //! arithmetic and negatives are recovered as p - |x|.
 //!
-//!   receipts-zk prove  witness.json out_dir  [raw|orion]
-//!   receipts-zk verify public.json  proof.bin [raw|orion]
+//!   receipts-zk commit weights.json out_dir  [orion]                      registration: commitment.hex
+//!   receipts-zk prove  witness.json out_dir  [raw|orion]                  proof.bin, public.json, commitment.hex
+//!   receipts-zk verify public.json  proof.bin [raw|orion] [--commitment HEX]
 
 use std::fs;
 use std::io::{BufReader, BufWriter, Cursor, Read};
@@ -29,7 +34,9 @@ use std::time::Instant;
 use arith::{Field, SimdField};
 use expander_binary::executor;
 use expander_compiler::frontend::*;
-use gkr_engine::MPIConfig;
+use gkr_engine::{ExpanderPCS, FieldEngine, MPIConfig, Proof};
+use poly_commit::expander_pcs_init_testing_only;
+use polynomials::RefMultiLinearPoly;
 use serde::{Deserialize, Serialize};
 use serdes::ExpSerde;
 
@@ -41,10 +48,9 @@ const S2_ABS_BOUND: u64 = 16 * 16 * 127 * 63;
 declare_circuit!(QDot {
     m: usize,
     k: usize,
-    dummy: [Variable],    // Expander requires a nontrivial private-input layer
-    q4: [PublicVariable], // m * k nibbles
-    sc: [PublicVariable], // m * nb * 8
-    mn: [PublicVariable], // m * nb * 8
+    q4: [Variable],       // m * k nibbles, private, under the registered commitment
+    sc: [Variable],       // m * nb * 8, private
+    mn: [Variable],       // m * nb * 8, private
     q8: [PublicVariable], // k
     s1: [PublicVariable], // m * nb
     s2: [PublicVariable], // m * nb
@@ -67,10 +73,6 @@ fn sum_tree<C: Config, B: RootAPI<C>>(api: &mut B, mut xs: Vec<Variable>) -> Var
 impl<C: Config> Define<C> for QDot<Variable> {
     fn define<B: RootAPI<C>>(&self, api: &mut B) {
         let (m, k) = (self.m, self.k);
-        for value in self.dummy.iter() {
-            let zero = api.constant(0);
-            api.assert_is_equal(*value, zero);
-        }
         let nb = k / QK_K;
         // group sums of the activation, shared by every output row
         let mut bsums = Vec::with_capacity(nb * 16);
@@ -115,14 +117,24 @@ struct WitnessFile {
     s2: Vec<i64>,
 }
 
+/// The weights alone: what registration commits to.
+#[derive(Serialize, Deserialize)]
+struct WeightsFile {
+    m: usize,
+    k: usize,
+    q4: Vec<u8>,
+    sc: Vec<u8>,
+    mn: Vec<u8>,
+}
+
+/// The public statement. `commitment` is the one embedded in the proof, for convenience; the
+/// verifier compares the proof's commitment against the registered value it was given.
 #[derive(Serialize, Deserialize)]
 struct PublicFile {
     m: usize,
     k: usize,
     config: String,
-    q4: Vec<u8>,
-    sc: Vec<u8>,
-    mn: Vec<u8>,
+    commitment: String,
     q8: Vec<i32>,
     s1: Vec<i64>,
     s2: Vec<i64>,
@@ -143,7 +155,6 @@ fn shape_circuit(m: usize, k: usize) -> QDot<Variable> {
     QDot {
         m,
         k,
-        dummy: vec![Variable::default(); 16],
         q4: vec![Variable::default(); m * k],
         sc: vec![Variable::default(); m * nb * 8],
         mn: vec![Variable::default(); m * nb * 8],
@@ -157,7 +168,6 @@ fn assignment<C: Config>(w: &WitnessFile) -> QDot<CircuitField<C>> {
     QDot {
         m: w.m,
         k: w.k,
-        dummy: vec![CircuitField::<C>::zero(); 16],
         q4: w.q4.iter().map(|&x| fe::<C>(x as i64)).collect(),
         sc: w.sc.iter().map(|&x| fe::<C>(x as i64)).collect(),
         mn: w.mn.iter().map(|&x| fe::<C>(x as i64)).collect(),
@@ -178,21 +188,87 @@ fn check_shape(w: &WitnessFile) {
     assert_eq!(w.s2.len(), w.m * nb);
 }
 
+fn check_weight_values(q4: &[u8], sc: &[u8], mn: &[u8]) {
+    assert!(q4.iter().all(|&x| x < 16), "q4 values must be in 0..15");
+    assert!(sc.iter().all(|&x| x < 64), "Q4_K scales must be in 0..63");
+    assert!(mn.iter().all(|&x| x < 64), "Q4_K mins must be in 0..63");
+}
+
+fn check_public_values(q8: &[i32], s1: &[i64], s2: &[i64]) {
+    assert!(q8.iter().all(|&x| (-127..=127).contains(&x)), "q8 values must be in -127..127");
+    assert!(s1.iter().all(|&x| x.unsigned_abs() <= S1_ABS_BOUND), "s1 exceeds the proven integer bound");
+    assert!(s2.iter().all(|&x| x.unsigned_abs() <= S2_ABS_BOUND), "s2 exceeds the proven integer bound");
+}
+
 fn check_values(w: &WitnessFile) {
-    assert!(w.q4.iter().all(|&x| x < 16), "q4 values must be in 0..15");
-    assert!(w.sc.iter().all(|&x| x < 64), "Q4_K scales must be in 0..63");
-    assert!(w.mn.iter().all(|&x| x < 64), "Q4_K mins must be in 0..63");
-    assert!(w.q8.iter().all(|&x| (-127..=127).contains(&x)), "q8 values must be in -127..127");
-    assert!(w.s1.iter().all(|&x| x.unsigned_abs() <= S1_ABS_BOUND), "s1 exceeds the proven integer bound");
-    assert!(w.s2.iter().all(|&x| x.unsigned_abs() <= S2_ABS_BOUND), "s2 exceeds the proven integer bound");
+    check_weight_values(&w.q4, &w.sc, &w.mn);
+    check_public_values(&w.q8, &w.s1, &w.s2);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// The PCS commitment to the circuit's private input layer. Expander's prover writes the public
+/// inputs into the proof first (its verifier reads them back and checks them), then the
+/// commitment; this skips the `n_public` public inputs the same way.
+fn commitment_from_proof<C: Config>(proof: &Proof, n_public: usize) -> String {
+    let mut cursor = Cursor::new(&proof.bytes[..]);
+    for _ in 0..n_public {
+        <<C::FieldConfig as FieldEngine>::SimdCircuitField as ExpSerde>::deserialize_from(&mut cursor).expect("public input in the proof");
+    }
+    let c = <<C::PCSConfig as ExpanderPCS<C::FieldConfig>>::Commitment as ExpSerde>::deserialize_from(&mut cursor)
+        .expect("commitment at the start of the proof");
+    let mut buf = Vec::new();
+    c.serialize_into(&mut buf).expect("commitment bytes");
+    hex(&buf)
+}
+
+/// Registration: the commitment to the private input layer that the circuit of shape (m, k)
+/// gets from these weights. No proof and no activation are involved; the public inputs stay
+/// at zero because they do not enter the private layer.
+fn commit<C: Config>(w: &WeightsFile, out_dir: &Path, config_name: &str) {
+    assert!(w.k % QK_K == 0, "k must be a multiple of 256");
+    let nb = w.k / QK_K;
+    assert_eq!(w.q4.len(), w.m * w.k);
+    assert_eq!(w.sc.len(), w.m * nb * 8);
+    assert_eq!(w.mn.len(), w.m * nb * 8);
+    check_weight_values(&w.q4, &w.sc, &w.mn);
+    assert!(config_name != "raw", "the raw configuration ships the witness inside the proof; there is nothing to register");
+
+    let t = Instant::now();
+    let compiled: CompileResult<C> = compile(&shape_circuit(w.m, w.k), CompileOptions::default()).expect("compile");
+    let full = WitnessFile { m: w.m, k: w.k, q4: w.q4.clone(), sc: w.sc.clone(), mn: w.mn.clone(),
+                             q8: vec![0; w.k], s1: vec![0; w.m * nb], s2: vec![0; w.m * nb] };
+    let n_pack = SIMDField::<C>::PACK_SIZE;
+    let assigns = vec![assignment::<C>(&full); n_pack];
+    let witness = compiled.witness_solver.solve_witnesses(&assigns).expect("witness");
+    let mut circuit = compiled.layered_circuit.export_to_expander_flatten();
+    let (simd_input, simd_public) = witness.to_simd();
+    circuit.layers[0].input_vals = simd_input;
+    circuit.public_input = simd_public;
+
+    let mpi = MPIConfig::prover_new(None, None);
+    let (params, pkey, _vkey, mut scratch) =
+        expander_pcs_init_testing_only::<C::FieldConfig, C::PCSConfig>(circuit.log_input_size(), &mpi);
+    let c = <C::PCSConfig as ExpanderPCS<C::FieldConfig>>::commit(
+        &params, &mpi, &pkey, &RefMultiLinearPoly::from_ref(&circuit.layers[0].input_vals), &mut scratch)
+        .expect("commit");
+    let mut buf = Vec::new();
+    c.serialize_into(&mut buf).expect("commitment bytes");
+    let h = hex(&buf);
+    fs::create_dir_all(out_dir).expect("out dir");
+    fs::write(out_dir.join("commitment.hex"), format!("{}\n", h)).expect("write commitment");
+    eprintln!("committed {} private inputs in {:.2}s: {}", w.q4.len() + w.sc.len() + w.mn.len(), t.elapsed().as_secs_f64(), h);
+    println!("{{\"commit_seconds\":{:.3},\"commitment\":\"{}\",\"config\":\"{}\"}}", t.elapsed().as_secs_f64(), h, config_name);
 }
 
 fn prove<C: Config>(w: &WitnessFile, out_dir: &Path, config_name: &str) {
     check_shape(w);
     check_values(w);
     let nb = w.k / QK_K;
-    eprintln!("circuit: m={} k={} blocks={} public inputs={}", w.m, w.k, nb,
-              w.m * w.k + 2 * w.m * nb * 8 + w.k + 2 * w.m * nb);
+    eprintln!("circuit: m={} k={} blocks={} private inputs={} public inputs={}", w.m, w.k, nb,
+              w.m * w.k + 2 * w.m * nb * 8, w.k + 2 * w.m * nb);
 
     let t = Instant::now();
     let compiled: CompileResult<C> = compile(&shape_circuit(w.m, w.k), CompileOptions::default()).expect("compile");
@@ -223,21 +299,31 @@ fn prove<C: Config>(w: &WitnessFile, out_dir: &Path, config_name: &str) {
     proof.serialize_into(&mut bytes).expect("proof");
     claimed_v.serialize_into(&mut bytes).expect("claimed value");
     fs::write(out_dir.join("proof.bin"), &bytes).expect("write proof");
-    let public = PublicFile { m: w.m, k: w.k, config: config_name.to_string(), q4: w.q4.clone(), sc: w.sc.clone(), mn: w.mn.clone(),
+    let commitment = if config_name == "raw" { String::new() } else { commitment_from_proof::<C>(&proof, circuit.public_input.len()) };
+    if !commitment.is_empty() {
+        fs::write(out_dir.join("commitment.hex"), format!("{}\n", commitment)).expect("write commitment");
+    }
+    let public = PublicFile { m: w.m, k: w.k, config: config_name.to_string(), commitment: commitment.clone(),
                               q8: w.q8.clone(), s1: w.s1.clone(), s2: w.s2.clone() };
     serde_json::to_writer(BufWriter::new(fs::File::create(out_dir.join("public.json")).unwrap()), &public).expect("public");
-    eprintln!("proved in {:.2}s: proof {} bytes, layers {}", prove_s, bytes.len(), n_layers);
-    println!("{{\"prove_seconds\":{:.3},\"proof_bytes\":{},\"layers\":{},\"config\":\"{}\"}}", prove_s, bytes.len(), n_layers, config_name);
+    eprintln!("proved in {:.2}s: proof {} bytes, layers {}, commitment {}", prove_s, bytes.len(), n_layers,
+              if commitment.is_empty() { "(raw: none)" } else { &commitment });
+    println!("{{\"prove_seconds\":{:.3},\"proof_bytes\":{},\"layers\":{},\"config\":\"{}\",\"commitment\":\"{}\"}}",
+             prove_s, bytes.len(), n_layers, config_name, commitment);
 }
 
-fn verify<C: Config>(p: &PublicFile, proof_path: &Path, config_name: &str) -> bool {
+fn verify<C: Config>(p: &PublicFile, proof_path: &Path, config_name: &str, registered: Option<&str>) -> bool {
     let t = Instant::now();
     let compiled: CompileResult<C> = compile(&shape_circuit(p.m, p.k), CompileOptions::default()).expect("compile");
     let compile_s = t.elapsed().as_secs_f64();
 
-    let w = WitnessFile { m: p.m, k: p.k, q4: p.q4.clone(), sc: p.sc.clone(), mn: p.mn.clone(), q8: p.q8.clone(), s1: p.s1.clone(), s2: p.s2.clone() };
+    // The verifier holds no weights. The private inputs are set to zero only to lay out the
+    // circuit; the proof's commitment and opening speak for their real values.
+    let nb = p.k / QK_K;
+    let w = WitnessFile { m: p.m, k: p.k, q4: vec![0; p.m * p.k], sc: vec![0; p.m * nb * 8], mn: vec![0; p.m * nb * 8],
+                          q8: p.q8.clone(), s1: p.s1.clone(), s2: p.s2.clone() };
     check_shape(&w);
-    check_values(&w);
+    check_public_values(&w.q8, &w.s1, &w.s2);
     let n_pack = SIMDField::<C>::PACK_SIZE;
     let assigns = vec![assignment::<C>(&w); n_pack];
     let witness = compiled.witness_solver.solve_witnesses(&assigns).expect("witness shape");
@@ -252,6 +338,16 @@ fn verify<C: Config>(p: &PublicFile, proof_path: &Path, config_name: &str) -> bo
     let proof = gkr_engine::Proof::deserialize_from(&mut cursor).expect("proof bytes");
     let claimed_v = <ChallengeField<C>>::deserialize_from(&mut cursor).expect("claimed value");
 
+    if let Some(reg) = registered {
+        assert!(config_name != "raw", "--commitment needs a committing configuration (orion)");
+        let got = commitment_from_proof::<C>(&proof, circuit.public_input.len());
+        if got != reg.trim() {
+            eprintln!("config {}: REJECT, the proof's commitment {} is not the registered {}", config_name, got, reg.trim());
+            println!("{{\"accept\":false,\"reason\":\"commitment mismatch\",\"config\":\"{}\"}}", config_name);
+            return false;
+        }
+    }
+
     let t = Instant::now();
     let mpi = MPIConfig::prover_new(None, None);
     let ok = executor::verify::<C>(&mut circuit, mpi, &proof, &claimed_v);
@@ -262,13 +358,22 @@ fn verify<C: Config>(p: &PublicFile, proof_path: &Path, config_name: &str) -> bo
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let mut registered: Option<String> = None;
+    if let Some(i) = args.iter().position(|a| a == "--commitment") {
+        registered = Some(args.get(i + 1).cloned().expect("--commitment HEX"));
+        args.drain(i..i + 2);
+    }
     if args.len() < 4 {
-        eprintln!("usage: receipts-zk prove witness.json out_dir [raw|orion]\n       receipts-zk verify public.json proof.bin [raw|orion]");
+        eprintln!("usage: receipts-zk commit weights.json out_dir [orion]\n       receipts-zk prove witness.json out_dir [raw|orion]\n       receipts-zk verify public.json proof.bin [raw|orion] [--commitment HEX]");
         std::process::exit(2);
     }
     let config = args.get(4).map(String::as_str).unwrap_or("orion").to_string();
     match args[1].as_str() {
+        "commit" => {
+            let w: WeightsFile = serde_json::from_reader(BufReader::new(fs::File::open(&args[2]).expect("weights file"))).expect("weights json");
+            commit::<M31OrionConfig>(&w, Path::new(&args[3]), &config);
+        }
         "prove" => {
             let w: WitnessFile = serde_json::from_reader(BufReader::new(fs::File::open(&args[2]).expect("witness file"))).expect("witness json");
             match config.as_str() {
@@ -280,8 +385,8 @@ fn main() {
             let p: PublicFile = serde_json::from_reader(BufReader::new(fs::File::open(&args[2]).expect("public file"))).expect("public json");
             let cfg = if args.len() > 4 { config.clone() } else { p.config.clone() };
             let ok = match cfg.as_str() {
-                "raw" => verify::<M31Config>(&p, Path::new(&args[3]), "raw"),
-                _ => verify::<M31OrionConfig>(&p, Path::new(&args[3]), "orion"),
+                "raw" => verify::<M31Config>(&p, Path::new(&args[3]), "raw", registered.as_deref()),
+                _ => verify::<M31OrionConfig>(&p, Path::new(&args[3]), "orion", registered.as_deref()),
             };
             std::process::exit(if ok { 0 } else { 1 });
         }

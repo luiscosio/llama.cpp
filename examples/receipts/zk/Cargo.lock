@@ -2238,6 +2238,8 @@ dependencies = [
  "bin",
  "expander_compiler",
  "gkr_engine",
+ "poly_commit",
+ "polynomials",
  "serde",
  "serde_json",
  "serdes",

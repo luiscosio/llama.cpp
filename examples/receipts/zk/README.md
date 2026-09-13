@@ -11,9 +11,9 @@ s1[m,i] = Σ_{j<8}  sc[m,i,j] · Σ_{l<32} q4[m,i,32j+l] · q8[i,32j+l]
 s2[m,i] = Σ_{j<16} bsums[i,j] · mn[m,i,j/2]        bsums[i,j] = Σ_{l<16} q8[i,16j+l]
 ```
 
-The weight's nibbles `q4` (0..15), sub-block scales `sc` and mins `mn` (0..63), activation quants `q8` (-127..127), and per-block sums `s1`, `s2` are public inputs. `zk_node.py` derives the weight inputs from the verifier's GGUF and refuses a public input file that differs. The verifier then applies the per-block float scales itself, `sum_i d_a[i] * (d[m,i] * s1[m,i] - dmin[m,i] * s2[m,i])`, and compares with the node's opened output. The integer core, millions of multiplications, is what the proof covers.
+The weight's nibbles `q4` (0..15), sub-block scales `sc` and mins `mn` (0..63) are private inputs. Expander commits to the circuit's private input layer and writes that commitment into the proof; `receipts-zk commit` computes the same commitment from the weights alone, which is what a registration publishes once per tensor, and `receipts-zk verify --commitment` refuses a proof whose commitment is not the registered one before any sumcheck runs. The activation quants `q8` (-127..127) and the per-block sums `s1`, `s2` are public and range-checked by prover and verifier before field conversion. The verifier then applies the per-block float scales itself, `sum_i d_a[i] * (d[m,i] * s1[m,i] - dmin[m,i] * s2[m,i])`, and compares with the node's opened output. The integer core, millions of multiplications, is what the proof covers.
 
-Making the weights public is deliberate. The earlier private-input version committed to some witness but did not bind that commitment to the claimed GGUF tensor. A future private version needs an in-circuit or externally verifiable commitment tied to the model. Until then, this proof provides arithmetic integrity but no weight privacy.
+Not zero-knowledge yet. Orion's commitment is a hash-based root without blinding, so it binds the weights but does not hide them, and Expander's GKR has no masking. What this establishes is model binding with a verifier that holds no weights. Weight ranges need no in-circuit constraints: the registration encodes the GGUF bytes, and nibbles and six-bit fields are in range by construction; the binding to the registered commitment is what keeps a prover from substituting values.
 
 Every per-block sum is below 2^25 in magnitude (proved in `../spec`, `s1_lt_2_pow_25` and `s2_bound`), so arithmetic in the M31 field equals integer arithmetic and negatives are read back as `p − |x|`.
 
@@ -25,34 +25,45 @@ Rust nightly 2025-05-17 (pinned in `rust-toolchain.toml`) and an MPI library (`b
 cd examples/receipts/zk
 cargo build --release
 
-# prove and verify a node from a receipt's trace, then check the float step against the opened output
+# register, prove and verify a node from a receipt's trace, run the negative cases, check the float step
 python3 zk_node.py receipt.json --model model.gguf --out zk-out            # first decode-graph Q4_K matmul
 python3 zk_node.py receipt.json --model model.gguf --index 779 --out zk-out # a specific opened leaf
-python3 zk_node.py receipt.json --model model.gguf --index 779 --out zk-out --verify-only # independently verify existing files
+python3 zk_node.py receipt.json --model model.gguf --index 779 --out zk-out --verify-only # verify existing files against the registered commitment
+
+# the three roles by hand
+receipts-zk commit weights.json registered/            # registration: registered/commitment.hex from {m, k, q4, sc, mn}
+receipts-zk prove  witness.json zk-out                 # proof.bin, public.json {q8, s1, s2}, commitment.hex
+receipts-zk verify zk-out/public.json zk-out/proof.bin orion --commitment $(cat registered/commitment.hex)
+
+# the circuit against the Lean specification on the same vectors
+python3 ../spec/gen_vectors.py receipt.json --model model.gguf --out vectors.json
+../spec/.lake/build/bin/spec-check vectors vectors.json --emit lean.json
+python3 diff_spec.py vectors.json lean.json
 ```
 
-`zk_node.py` reads the opening's bytes and the verifier's GGUF, quantizes the activation to `Q8_K` with the same code the verifier uses, writes `witness.json`, runs `receipts-zk prove`, checks every proof public input against the independently derived value, runs `receipts-zk verify`, verifies a tampered public sum is rejected, and applies the float step. `--verify-only` skips proof creation and performs those checks on an existing proof directory. Receipts must come from the CPU backend for the integer statement to describe the kernel that ran; Metal's kernels use float32 activations.
+`zk_node.py` reads the opening's bytes and the GGUF, quantizes the activation to `Q8_K` with the same code the verifier uses, registers the tensor's commitment from the weights alone (`registered/commitment.hex`; in a deployment this happens once per model, elsewhere), writes `witness.json`, runs `receipts-zk prove`, runs `receipts-zk verify --commitment` with the registered value, and then the negative cases: a tampered public sum, a proof made with one changed nibble and consistent sums (its commitment differs), and the honest proof against the registered commitment of the same tensor in the next layer. Finally it applies the float step. `--verify-only` repeats the verification of an existing directory. `diff_spec.py` feeds the circuit the sums the Lean spec computed (`spec-check vectors --emit`) instead of Python's, so the circuit is checked against the specification. Receipts must come from the CPU backend for the integer statement to describe the kernel that ran; Metal's kernels use float32 activations.
 
-The `orion` and `raw` options remain available as Expander configurations, but neither hides model weights in this circuit because the weights are public statement values.
+`orion` is the configuration that commits. `raw` ships the witness inside the proof: useful to debug the circuit, meaningless as a proof, and `commit` refuses it.
 
 ## Results
 
-Apple M5, qwen2.5 1.5B Q4_K_M, one activation row from a CPU trace, public weights (Sep 11, 2026):
+Apple M5, qwen2.5 1.5B Q4_K_M, one activation row from a CPU trace, private weights under a registered Orion commitment (Sep 13, 2026):
 
-| Node | Weight | Public inputs | Compile | Witness | Prove | Proof | Verify | Float step error | Tampered sum |
+| Node | Weight | Private inputs | Register | Compile | Prove | Proof | Verify | Float step error | Rejected |
 |---|---|---|---|---|---|---|---|---|---|
-| `Kcur-13`, 256 x 1536 | `blk.13.attn_k.weight` | 422,400 | 2.3 s | 0.03 s | 0.19 s | 27.9 MB | 0.20 s | 2.0e-7 | rejected |
+| `Vcur-22`, 256 x 1536 | `blk.22.attn_v.weight` | 417,792 | 2.0 s | 1.8 s | 0.28 s | 6.5 MB | 0.04 s | 3.8e-7 | tampered sum, other weights, other tensor |
 
-The circuit has four layers. Verification recompiles the circuit from its shape; caching the compiled circuit per shape would remove that cost. Expander packs 16 SIMD lanes, so batching 16 different rows or nodes into those lanes is free throughput left on the table.
+The circuit has four layers. Verification recompiles the circuit from its shape, the compile column; caching the compiled circuit per shape would remove that cost. Expander packs 16 SIMD lanes, so batching 16 different rows or nodes into those lanes is free throughput left on the table. Registration time is the Orion encoding and Merkle tree over the private layer.
 
 ## What this establishes
 
 - llama.cpp's native block-quantized arithmetic can be stated as a circuit without dequantizing to float, and proven with an existing GKR prover in seconds for one node.
-- The proof binds all quantized weight values as public inputs; the verifier checks them against the claimed GGUF before accepting the proof.
-- Prover and verifier check the Q4_K and Q8_K ranges and the sum bounds on every public input before field conversion, so a value that would alias in Mersenne-31 is refused rather than proven.
+- The proof is bound to the model: its commitment to the private weights must equal a value registered once per tensor from the GGUF, and the verifier needs no weights, only that value, the public inputs and the proof.
+- Prover and verifier check the Q8_K range and the proven sum bounds on every public input before field conversion, so a value that would alias in Mersenne-31 is refused rather than proven. Weight ranges hold by construction of the registration encoding.
+- The circuit accepts exactly the sums the Lean spec computes and rejects a one-off change (`diff_spec.py`).
 - The sums the circuit outputs are exactly the ones the Lean spec defines and bounds.
 
-Not yet: private weights under a model-bound commitment, the other ops of a layer, proving every matmul of a token instead of one node, batching, a GPU prover, and publishing a commitment once per model so the verifier does not need the GGUF. The per-node circuit is also the natural unit for a proof that the circuit matches the Lean spec.
+Not yet: zero knowledge (masking in the GKR, a hiding commitment), the other ops of a layer, Q6_K matmuls, proving every matmul of a token instead of one node, batching, published commitment parameters instead of Expander's testing-only ones, and a GPU prover. The per-node circuit is also the natural unit for a proof that the circuit matches the Lean spec. The Stage 1 record in the project's `docs/stage1/` lists what each of these needs.
 
 ## Dependencies and licence
 

@@ -4,16 +4,28 @@
     python3 zk_node.py receipt.json --model model.gguf [--index N] [--config orion|raw] [--out dir]
 
 Picks a MUL_MAT opening whose weight is Q4_K (the first decode-graph one unless --index
-is given), extracts the witness from the opened bytes and the verifier's own GGUF:
+is given), extracts the witness from the opened bytes and the GGUF:
 
-    q4, sc, mn   the weight's nibbles, sub-block scales and mins (public, checked from the GGUF)
-    q8           the activation row quantized to Q8_K exactly as ggml does
-    s1, s2       the per-block integer sums the circuit must reproduce
+    q4, sc, mn   the weight's nibbles, sub-block scales and mins (private, under a commitment)
+    q8           the activation row quantized to Q8_K exactly as ggml does (public)
+    s1, s2       the per-block integer sums the circuit must reproduce (public)
 
-then runs `receipts-zk prove`, `receipts-zk verify`, and finally applies the per-block
-float scales to s1 and s2 the way ggml's kernel does and compares with the node's
-opened output. The proof covers the integer core; the float step is a few thousand
-multiply-adds the receipt verifier does itself.
+Three roles, run here one after the other:
+
+    register   `receipts-zk commit` on the weights from the GGUF: the tensor's commitment,
+               which a deployment would publish once per model (registered.hex);
+    prove      `receipts-zk prove` on the witness: proof.bin, public.json, commitment.hex;
+    verify     `receipts-zk verify --commitment registered.hex`: the verifier never sees the
+               weights, only the registered commitment, the public inputs and the proof.
+
+Then the negative cases: a tampered public sum, a proof made with different weights (whose
+commitment therefore differs), and the registered commitment of another tensor. Finally
+the per-block float scales are applied to s1 and s2 the way ggml's kernel does and the
+result is compared with the node's opened output. The proof covers the integer core; the
+float step is a few thousand multiply-adds the receipt verifier does itself.
+
+Not zero-knowledge yet: the commitment binds but does not hide, and Expander's GKR has no
+masking. What is established is model binding with a verifier that holds no weights.
 
 Requires the receipts-zk binary (cargo build --release in this directory) and numpy.
 """
@@ -73,8 +85,10 @@ def main(argv=None) -> int:
     p.add_argument("--config", default="orion", choices=["orion", "raw"])
     p.add_argument("--out", default="zk-out")
     p.add_argument("--binary", default=str(HERE / "target" / "release" / "receipts-zk"))
-    p.add_argument("--verify-only", action="store_true", help="verify an existing public.json and proof.bin without creating a proof")
+    p.add_argument("--verify-only", action="store_true", help="verify an existing proof against the registered commitment without proving")
     a = p.parse_args(argv)
+    if a.config == "raw":
+        print("the raw configuration ships the witness inside the proof; use it only to debug the circuit")
 
     rec = json.loads(Path(a.receipt).read_text())
     tpath = Path(a.trace) if a.trace else Path(a.receipt).with_name(Path(a.receipt).name.removesuffix(".json") + ".trace.json")
@@ -106,55 +120,120 @@ def main(argv=None) -> int:
     bsums = bsums[0]
 
     s1, s2 = integer_sums(q4.reshape(M, -1), sc, mn, q8, bsums)
-    witness = {"m": M, "k": K, "q4": q4.reshape(-1).astype(int).tolist(), "sc": sc.reshape(-1).astype(int).tolist(),
-               "mn": mn.reshape(-1).astype(int).tolist(), "q8": q8.tolist(), "s1": s1.reshape(-1).tolist(), "s2": s2.reshape(-1).tolist()}
+    weights = {"m": M, "k": K, "q4": q4.reshape(-1).astype(int).tolist(), "sc": sc.reshape(-1).astype(int).tolist(),
+               "mn": mn.reshape(-1).astype(int).tolist()}
+    witness = {**weights, "q8": q8.tolist(), "s1": s1.reshape(-1).tolist(), "s2": s2.reshape(-1).tolist()}
     outdir = Path(a.out)
     outdir.mkdir(parents=True, exist_ok=True)
-    print(f"statement: {M * K} nibbles, {M * nb * 8} scales, {M * nb * 8} mins, {K} activations, {2 * M * nb} sums public")
+    print(f"statement: {M * K} nibbles, {M * nb * 8} scales, {M * nb * 8} mins private under the registered commitment; "
+          f"{K} activations, {2 * M * nb} sums public")
 
     # the float step the receipt verifier performs itself, as ggml's kernel does after the integer core
     ref = (d_a[0][None, :] * d_w * s1 - d_a[0][None, :] * dmin * s2).sum(axis=1)
     err = vt.normalized_error(out[0], ref)
     print(f"float step: max|out - ref| / max|ref| = {err:.2e} against the opened output")
 
-    prove_stats = None
-    t_prove = 0.0
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([a.binary, *args], capture_output=True, text=True)
+
+    def last_json(r: subprocess.CompletedProcess) -> dict:
+        return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {"accept": False}
+
+    prove_stats = commit_stats = None
+    t_prove = t_commit = 0.0
+    committing = a.config != "raw"
     if not a.verify_only:
+        if committing:
+            # registration: the tensor's commitment from the GGUF alone (here on the same machine; a
+            # deployment publishes it once per model and the verifier pins it)
+            (outdir / "weights.json").write_text(json.dumps(weights))
+            t = time.time()
+            r = run("commit", str(outdir / "weights.json"), str(outdir / "registered"))
+            print(r.stderr.strip())
+            if r.returncode != 0:
+                print("commit failed", r.stdout)
+                return 1
+            commit_stats = last_json(r)
+            t_commit = time.time() - t
         (outdir / "witness.json").write_text(json.dumps(witness))
         t = time.time()
-        r = subprocess.run([a.binary, "prove", str(outdir / "witness.json"), str(outdir), a.config], capture_output=True, text=True)
+        r = run("prove", str(outdir / "witness.json"), str(outdir), a.config)
         print(r.stderr.strip())
         if r.returncode != 0:
             print("prove failed", r.stdout)
             return 1
-        prove_stats = json.loads(r.stdout.strip().splitlines()[-1])
+        prove_stats = last_json(r)
         t_prove = time.time() - t
 
     public = json.loads((outdir / "public.json").read_text())
-    for key in ("q4", "sc", "mn", "q8", "s1", "s2"):
+    for key in ("q8", "s1", "s2"):
         if public[key] != witness[key]:
-            raise RuntimeError(f"proof public input {key} differs from the value derived from the GGUF and trace")
+            raise RuntimeError(f"proof public input {key} differs from the value derived from the trace")
+    registered = (outdir / "registered" / "commitment.hex").read_text().strip() if committing else ""
+    commit_args = ["--commitment", registered] if committing else []
+    if committing:
+        print(f"registered commitment {registered[:16]}..., proof carries {public['commitment'][:16]}...")
 
     t = time.time()
-    v = subprocess.run([a.binary, "verify", str(outdir / "public.json"), str(outdir / "proof.bin"), a.config], capture_output=True, text=True)
+    v = run("verify", str(outdir / "public.json"), str(outdir / "proof.bin"), a.config, *commit_args)
     print(v.stderr.strip())
-    verify_stats = json.loads(v.stdout.strip().splitlines()[-1]) if v.stdout.strip() else {"accept": False}
+    verify_stats = last_json(v)
     t_verify = time.time() - t
 
-    # a tampered public sum must not verify
-    bad = json.loads((outdir / "public.json").read_text())
+    # negative 1: a tampered public sum must not verify
+    bad = dict(public)
+    bad["s1"] = list(public["s1"])
     bad["s1"][0] += 1
     (outdir / "public-tampered.json").write_text(json.dumps(bad))
-    b = subprocess.run([a.binary, "verify", str(outdir / "public-tampered.json"), str(outdir / "proof.bin"), a.config], capture_output=True, text=True)
-    tampered_accept = b.returncode == 0
+    tampered_accept = run("verify", str(outdir / "public-tampered.json"), str(outdir / "proof.bin"), a.config, *commit_args).returncode == 0
+
+    other_weights_accept = other_tensor_accept = False
+    if committing and not a.verify_only:
+        # negative 2: a prover with different weights. One nibble changed and the sums recomputed
+        # so its circuit is satisfied; its commitment differs from the registered one.
+        q4_bad = q4.reshape(M, -1).copy()
+        q4_bad[0, 0] = (q4_bad[0, 0] + 1) % 16
+        s1_bad, s2_bad = integer_sums(q4_bad, sc, mn, q8, bsums)
+        wit_bad = {**witness, "q4": q4_bad.reshape(-1).astype(int).tolist(), "s1": s1_bad.reshape(-1).tolist(), "s2": s2_bad.reshape(-1).tolist()}
+        (outdir / "other-weights").mkdir(exist_ok=True)
+        (outdir / "other-weights" / "witness.json").write_text(json.dumps(wit_bad))
+        r = run("prove", str(outdir / "other-weights" / "witness.json"), str(outdir / "other-weights"), a.config)
+        if r.returncode != 0:
+            print("other-weights prove failed", r.stdout)
+            return 1
+        other = run("verify", str(outdir / "other-weights" / "public.json"), str(outdir / "other-weights" / "proof.bin"), a.config, *commit_args)
+        other_weights_accept = other.returncode == 0
+        print(other.stderr.strip().splitlines()[-1])
+        # negative 3: the honest proof against the registered commitment of another tensor of the
+        # same shape (the same weight in the next layer)
+        layer = int(name.split(".")[1])
+        other_name = name.replace(f"blk.{layer}.", f"blk.{layer + 1}.")
+        if other_name not in store.hashes:
+            other_name = name.replace(f"blk.{layer}.", f"blk.{layer - 1}.")
+        _, _, sc_o, mn_o, q4_o = vt.unpack_q4_k(store.blocks(other_name))
+        (outdir / "other-tensor").mkdir(exist_ok=True)
+        (outdir / "other-tensor" / "weights.json").write_text(json.dumps({"m": M, "k": K, "q4": q4_o.reshape(-1).astype(int).tolist(),
+                                                                          "sc": sc_o.reshape(-1).astype(int).tolist(), "mn": mn_o.reshape(-1).astype(int).tolist()}))
+        r = run("commit", str(outdir / "other-tensor" / "weights.json"), str(outdir / "other-tensor"))
+        if r.returncode != 0:
+            print("other-tensor commit failed", r.stdout)
+            return 1
+        other_reg = (outdir / "other-tensor" / "commitment.hex").read_text().strip()
+        ot = run("verify", str(outdir / "public.json"), str(outdir / "proof.bin"), a.config, "--commitment", other_reg)
+        other_tensor_accept = ot.returncode == 0
+        print(f"{other_name}: {ot.stderr.strip().splitlines()[-1]}")
 
     summary = {"leaf": o["index"], "node": leaf["name"], "weight": name, "m": M, "k": K, "config": a.config,
-               "float_step_error": err, "prove": prove_stats, "prove_wall_seconds": round(t_prove, 3),
-               "verify": verify_stats, "verify_wall_seconds": round(t_verify, 3), "tampered_sum_accepted": tampered_accept}
+               "float_step_error": err, "commit": commit_stats, "commit_wall_seconds": round(t_commit, 3),
+               "prove": prove_stats, "prove_wall_seconds": round(t_prove, 3),
+               "verify": verify_stats, "verify_wall_seconds": round(t_verify, 3),
+               "tampered_sum_accepted": tampered_accept, "other_weights_accepted": other_weights_accept,
+               "other_tensor_commitment_accepted": other_tensor_accept}
     (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
     print(json.dumps(summary, indent=1))
-    ok = verify_stats.get("accept") and not tampered_accept and err < 1e-5
-    print("RESULT:", "proof verifies, tampered sum rejected, float step matches" if ok else "FAILED")
+    ok = verify_stats.get("accept") and not tampered_accept and not other_weights_accept and not other_tensor_accept and err < 1e-5
+    print("RESULT:", "proof verifies against the registered commitment; tampered sum, other weights and other tensor rejected; float step matches"
+          if ok else "FAILED")
     return 0 if ok else 1
 
 

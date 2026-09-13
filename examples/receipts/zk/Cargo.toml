@@ -18,6 +18,8 @@ expander_binary = { git = "https://github.com/PolyhedraZK/Expander", branch = "m
 gkr_engine = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 arith = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 serdes = { git = "https://github.com/PolyhedraZK/Expander", branch = "main", package = "serdes" }
+poly_commit = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
+polynomials = { git = "https://github.com/PolyhedraZK/Expander", branch = "main" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

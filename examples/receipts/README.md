@@ -122,7 +122,7 @@ A larger matrix on the same design, run with a Python prototype of this tracer o
 
 ## Proof of one node
 
-`zk/` proves the integer core of one opened matmul node with Expander (GKR over Mersenne-31). The weight nibbles, scales and mins are public proof inputs so the verifier can compare them directly with its GGUF; the verifier checks their quantization ranges and the bounds on the public sums before anything is converted to the field. The receipt verifier applies the float scales itself. See `zk/README.md`.
+`zk/` proves the integer core of one opened matmul node with Expander (GKR over Mersenne-31). The weight nibbles, scales and mins are private inputs bound to a commitment registered once per tensor from the GGUF (`receipts-zk commit`); the verifier holds no weights and refuses a proof whose commitment differs. The activation quants and the per-block sums are public and range-checked before field conversion, and the receipt verifier applies the float scales itself. Not zero-knowledge yet: the commitment binds but does not hide, and the GKR has no masking. See `zk/README.md`.
 
 ## Limits
 
