@@ -47,17 +47,17 @@ python3 diff_spec.py vectors.json lean.json
 
 ## Zero-knowledge proofs of the same statement (Groth16)
 
-Expander has no zero-knowledge layer, so `groth16/` proves the same integer core with an established one: a circom circuit (`qdot_rows.circom`) and Groth16 through snarkjs. The weights of a group of rows (64 rows for K up to 1536, 32 for K = 2048) are private inputs as bits, so every nibble and six-bit field is in range by construction; a Poseidon chain over the packed weights and a salt is the public commitment; the activation quants and the per-block sums are public inputs. Groth16 proofs are zero-knowledge and about 800 bytes, and `snarkjs.groth16.verify` runs in a browser.
+Expander has no zero-knowledge layer, so `groth16/` proves the same integer core with an established one: a circom circuit (`qdot_rows.circom`) and Groth16 through snarkjs. The weights of a group of rows (16 rows for K up to 1536, 8 for K = 2048, about 150k constraints per proof) are private inputs as bits, so every nibble and six-bit field is in range by construction; a Poseidon chain over the packed weights and a salt is the public commitment; the activation quants and the per-block sums are public inputs. Groth16 proofs are zero-knowledge and about 800 bytes, and `snarkjs.groth16.verify` runs in a browser.
 
 ```bash
 cd groth16 && npm install                                   # snarkjs, circomlib, circomlibjs; circom from cargo install --git https://github.com/iden3/circom
-# one instance per (rows, K); build/r64_k1536, build/r64_k1024, build/r32_k2048 are the shapes of the two models here
-./setup.sh build/r64_k1536 ptau/pot20_final.ptau            # Groth16 setup and one phase-2 contribution: main_final.zkey, verification_key.json
+# one instance per (rows, K); build/r16_k1536 (the 1.5B demo node), build/r16_k1024, build/r8_k2048 and build/r8_k3072 (Qwen3-0.6B) are the shapes here
+./setup.sh build/r16_k1536 ptau/pot18_final.ptau            # Groth16 setup and one phase-2 contribution: main_final.zkey, verification_key.json
 python3 groth16_node.py receipt.json --model model.gguf --index N [--manifest manifest.json] [--groups 0,1] --out groth16-out
 python3 ../register.py --augment manifest.json --model model.gguf --groth16   # one Poseidon commitment per row group, per Q4_K tensor
 ```
 
-`groth16_node.py` proves each row group of the opened node, verifies it, checks the proof's commitment against the registered one (from `--manifest`, or recomputed with `commit.js`), and runs the negatives: a tampered public sum and another group's commitment. The powers of tau are generated locally (`snarkjs powersoftau`, 2^20) because the public Hermez mirrors no longer serve the files; together with the single phase-2 contribution these are proof-of-concept parameters, and a deployment would use a ceremony. What the proof does not cover is unchanged: the float scales, the other operations of the token, and the sampled output.
+`groth16_node.py` proves each row group of the opened node, verifies it, checks the proof's commitment against the registered one (from `--manifest`, or recomputed with `commit.js`), and runs the negatives: a tampered public sum and another group's commitment. The powers of tau are generated locally (`snarkjs powersoftau`, 2^18) because the public Hermez mirrors no longer serve the files; together with the single phase-2 contribution these are proof-of-concept parameters, and a deployment would use a ceremony. What the proof does not cover is unchanged: the float scales, the other operations of the token, and the sampled output.
 
 ## Registration
 
@@ -65,7 +65,8 @@ python3 ../register.py --augment manifest.json --model model.gguf --groth16   # 
 
 ```bash
 python3 register.py model.gguf --out manifest.json --commit --source-url URL --source-sha256 HEX --quantize-cmd "llama-quantize ..."
-python3 register.py --check manifest.json --model other-copy.gguf [--commit]   # recompute and compare; exit 0 only if nothing differs
+python3 register.py --check manifest.json --model other-copy.gguf [--commit] [--groth16]   # recompute and compare; exit 0 only if nothing differs
+python3 register.py --augment manifest.json --model model.gguf --commit --limit 40   # add Orion commitments in resumable batches (receipts-zk commit-many, one circuit compile per shape)
 python3 zk_node.py receipt.json --model model.gguf --index N --manifest manifest.json --out zk-out   # verifier takes the commitment from the manifest
 ```
 
@@ -79,7 +80,18 @@ Apple M5, qwen2.5 1.5B Q4_K_M, one activation row from a CPU trace, private weig
 |---|---|---|---|---|---|---|---|---|---|
 | `Vcur-22`, 256 x 1536 | `blk.22.attn_v.weight` | 417,792 | 2.0 s | 1.8 s | 0.28 s | 6.5 MB | 0.04 s | 3.8e-7 | tampered sum, other weights, other tensor |
 
-The circuit has four layers. Verification recompiles the circuit from its shape, the compile column; caching the compiled circuit per shape would remove that cost. Expander packs 16 SIMD lanes, so batching 16 different rows or nodes into those lanes is free throughput left on the table. Registration time is the Orion encoding and Merkle tree over the private layer.
+Groth16 (`groth16/`), Apple M5, 2^18 setup generated locally, weights private under a Poseidon commitment, one proof per row group (Sep 13, 2026):
+
+| Node | Weight | Circuit | Groups | Witness | Prove per group | Proof | Package | Verify | Rejected |
+|---|---|---|---|---|---|---|---|---|---|
+| `Vcur-22`, 256 x 1536 (1.5B) | `blk.22.attn_v.weight` | `r16_k1536` | 16 of 16 proven | 0.3 s | 2.9 to 3.4 s | 805 B | 72 KB | 0.16 s | tampered sum, other group, 16 times each |
+| `Kcur-0`, 1024 x 1024 (0.6B) | `blk.0.attn_k.weight` | `r16_k1024` | 2 of 64 | 0.3 s | 2.5 to 2.7 s | 805 B | 45 KB | 0.16 s | same |
+| attention output, 1024 x 2048 (0.6B) | `blk.0.attn_output.weight` | `r8_k2048` | 2 of 128 | 0.2 s | 2.5 to 2.7 s | 805 B | 94 KB | 0.17 s | same |
+| `ffn_out-10`, 1024 x 3072 (0.6B) | `blk.10.ffn_down.weight` | `r8_k3072` | 2 of 128 | 0.3 s | 2.9 to 3.1 s | 805 B | 142 KB | 0.17 s | same |
+
+The package is the proof plus `public.json` (the activation quants and sums as decimal strings); the proof itself is three curve points. Setup of one instance takes 36 s; the zkey is 78 to 108 MB and the verification key 214 to 600 KB, growing with the number of public inputs. The 0.6B proofs were checked against the registered manifest (`--manifest`), the 1.5B ones against commitments recomputed on the spot, since that model is not registered.
+
+The Expander circuit has four layers. Verification recompiles the circuit from its shape, the compile column; caching the compiled circuit per shape would remove that cost. Expander packs 16 SIMD lanes, so batching 16 different rows or nodes into those lanes is free throughput left on the table. Registration time is the Orion encoding and Merkle tree over the private layer.
 
 ## What this establishes
 

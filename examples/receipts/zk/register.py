@@ -44,14 +44,14 @@ from gguf import GGUFReader  # noqa: E402
 STATEMENT_VERSION = "stmt/v0"
 COMMITMENT_SCHEME = "expander-orion/m31x16/receipts-zk-qdot"
 GROTH16_SCHEME = "groth16-poseidon/bn254/qdot_rows"
-GROTH16_MAX_NIBBLES = 64 * 1536  # what fits a 2^20 Groth16 setup with room to spare
+GROTH16_MAX_NIBBLES = 16 * 1536  # about 150k constraints per proof: a setup of minutes on a laptop, not an hour
 
 
 def groth16_rows(k: int) -> int:
     """Rows per Groth16 proof for a tensor with K columns: the largest power of two with at most
-    GROTH16_MAX_NIBBLES nibbles per group, capped at 64."""
+    GROTH16_MAX_NIBBLES nibbles per group, capped at 16 (16 for K up to 1536, 8 for K = 2048)."""
     rows = 1
-    while rows * 2 <= 64 and rows * 2 * k <= GROTH16_MAX_NIBBLES:
+    while rows * 2 <= 16 and rows * 2 * k <= GROTH16_MAX_NIBBLES:
         rows *= 2
     return rows
 
@@ -137,6 +137,38 @@ def groth16_commitments(store: vt.WeightStore, name: str, m: int, rows: int, sal
     return json.loads(r.stdout.strip())
 
 
+def add_orion(tensors: list[dict], store: vt.WeightStore, binary: str, limit: int | None = None) -> int:
+    """Orion commitments for every Q4_K tensor without one, through `receipts-zk commit-many`
+    (one circuit compile per shape). Writes the weights files to a temporary directory."""
+    todo = [e for e in tensors if e["type"] == "Q4_K" and len(e["shape"]) == 2 and e["shape"][0] % 256 == 0 and "commitment" not in e]
+    todo.sort(key=lambda e: (e["shape"][0], e["shape"][1]))  # one shape after another, so a --limit batch needs few circuit compiles
+    if limit is not None:
+        todo = todo[:limit]
+    if not todo:
+        return 0
+    with tempfile.TemporaryDirectory() as tmp:
+        items = []
+        for e in todo:
+            k, m = e["shape"][0], e["shape"][1]
+            _, _, sc, mn, q4 = vt.unpack_q4_k(store.blocks(e["name"]))
+            path = Path(tmp) / (e["name"] + ".json")
+            path.write_text(json.dumps({"m": m, "k": k, "q4": q4.reshape(-1).astype(int).tolist(), "sc": sc.reshape(-1).astype(int).tolist(), "mn": mn.reshape(-1).astype(int).tolist()}))
+            items.append({"name": e["name"], "weights": str(path)})
+        (Path(tmp) / "list.json").write_text(json.dumps(items))
+        t = time.time()
+        r = subprocess.run([binary, "commit-many", str(Path(tmp) / "list.json"), str(Path(tmp) / "out.json")], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"commit-many failed: {r.stderr.strip()[-400:]}")
+        values = json.loads((Path(tmp) / "out.json").read_text())
+        secs = time.time() - t
+    by_name = {e["name"]: e for e in tensors}
+    for name, value in values.items():
+        e = by_name[name]
+        e["commitment"] = {"scheme": COMMITMENT_SCHEME, "circuit": f"qdot(m={e['shape'][1]},k={e['shape'][0]})", "value": value}
+    print(f"  orion: {len(values)} tensors committed in {secs:.1f}s", file=sys.stderr)
+    return len(values)
+
+
 def add_groth16(manifest: dict, store: vt.WeightStore, limit: int | None = None) -> int:
     n = 0
     for entry in manifest["tensors"]:
@@ -144,6 +176,8 @@ def add_groth16(manifest: dict, store: vt.WeightStore, limit: int | None = None)
         rows = groth16_rows(shape[0]) if len(shape) == 2 else 0
         if entry["type"] != "Q4_K" or len(shape) != 2 or shape[0] % 256 != 0 or shape[1] % rows != 0:
             continue
+        if "groth16" in entry:
+            continue  # already registered: --augment resumes where the last run stopped
         if limit is not None and n >= limit:
             break
         t = time.time()
@@ -152,7 +186,7 @@ def add_groth16(manifest: dict, store: vt.WeightStore, limit: int | None = None)
                             "salt": "0", "groups": groups, "seconds": round(time.time() - t, 2)}
         n += 1
         print(f"  groth16 {entry['name']}: {len(groups)} group commitments in {time.time() - t:.1f}s", file=sys.stderr)
-    manifest["proof_system"]["groth16"] = {"scheme": GROTH16_SCHEME, "circuit": "groth16/qdot_rows.circom", "rows_per_group": "r{rows}_k{K}: 64 rows for K <= 1536, 32 for K = 2048",
+    manifest["proof_system"]["groth16"] = {"scheme": GROTH16_SCHEME, "circuit": "groth16/qdot_rows.circom", "rows_per_group": "r{rows}_k{K}: 16 rows for K <= 1536, 8 for K = 2048",
                                            "hiding": "Poseidon over the packed weights with a salt (0 for open weights)", "zero_knowledge": True,
                                            "setup": "Groth16 phase 2 with one contributor over a locally generated 2^20 powers of tau: proof-of-concept parameters"}
     return n
@@ -167,18 +201,13 @@ def build(a) -> dict:
     tensors = []
     commit_total = 0.0
     n_committed = 0
-    with tempfile.TemporaryDirectory() as tmp:
-        for t in reader.tensors:
-            shape = [int(x) for x in t.shape]
-            entry = {"name": t.name, "type": t.tensor_type.name, "shape": shape, "n_bytes": int(t.n_bytes), "sha256": store.hashes[t.name]}
-            if a.commit and t.tensor_type.name == "Q4_K" and len(shape) == 2 and shape[0] % 256 == 0 and (a.limit is None or n_committed < a.limit):
-                k, m = shape[0], shape[1]
-                value, secs = commit_tensor(a.binary, store, t.name, m, k, Path(tmp))
-                entry["commitment"] = {"scheme": COMMITMENT_SCHEME, "circuit": f"qdot(m={m},k={k})", "value": value, "seconds": round(secs, 2)}
-                commit_total += secs
-                n_committed += 1
-                print(f"  committed {t.name} ({m} x {k}) in {secs:.1f}s: {value[:16]}...", file=sys.stderr)
-            tensors.append(entry)
+    for t in reader.tensors:
+        shape = [int(x) for x in t.shape]
+        tensors.append({"name": t.name, "type": t.tensor_type.name, "shape": shape, "n_bytes": int(t.n_bytes), "sha256": store.hashes[t.name]})
+    if a.commit:
+        t0 = time.time()
+        n_committed = add_orion(tensors, store, a.binary, a.limit)
+        commit_total = time.time() - t0
     manifest = {
         "manifest_version": "registration/v0",
         "created_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -211,11 +240,17 @@ def augment(a) -> int:
     store = vt.WeightStore(a.model)
     if vt.sha256_file(a.model) != manifest["model"]["file_sha256"]:
         print("this GGUF is not the registered file"); return 1
-    n = add_groth16(manifest, store, a.limit)
-    manifest["registration"]["groth16_tensors"] = n
+    n = add_groth16(manifest, store, a.limit) if a.groth16 else 0
+    total = sum(1 for e in manifest["tensors"] if e.get("groth16"))
+    manifest["registration"]["groth16_tensors"] = total
+    if a.commit:
+        n_o = add_orion(manifest["tensors"], store, a.binary, a.limit)
+        manifest["registration"]["committed_tensors"] = sum(1 for e in manifest["tensors"] if e.get("commitment"))
+        n += n_o
     manifest["manifest_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
     Path(a.out or a.augment).write_text(json.dumps(manifest, indent=1))
-    print(f"manifest {manifest['manifest_id'][:16]}...: groth16 commitments added for {n} tensors, written to {a.out or a.augment}")
+    print(f"manifest {manifest['manifest_id'][:16]}...: {n} commitments added ({total} tensors with Groth16, "
+          f"{manifest['registration'].get('committed_tensors', 0)} with Orion), written to {a.out or a.augment}")
     return 0
 
 
@@ -272,7 +307,7 @@ def main(argv=None) -> int:
     p.add_argument("--model", dest="model_opt")
     p.add_argument("--commit", action="store_true", help="also compute the Orion commitment of every Q4_K tensor (or check them)")
     p.add_argument("--groth16", action="store_true", help="also compute the Poseidon group commitments the Groth16 circuit uses (or check them)")
-    p.add_argument("--augment", help="add --groth16 commitments to this existing manifest (with --model), writing --out or in place")
+    p.add_argument("--augment", help="add --groth16 and/or --commit (Orion) commitments to this existing manifest (with --model), writing --out or in place; resumes")
     p.add_argument("--limit", type=int, help="commit or check only the first N Q4_K tensors (testing)")
     p.add_argument("--binary", default=str(HERE / "target" / "release" / "receipts-zk"))
     p.add_argument("--source-url")

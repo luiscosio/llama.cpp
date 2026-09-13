@@ -23,6 +23,7 @@
 //! arithmetic and negatives are recovered as p - |x|.
 //!
 //!   receipts-zk commit weights.json out_dir  [orion]                      registration: commitment.hex
+//!   receipts-zk commit-many list.json out.json                            registration of many tensors, one circuit compile per shape
 //!   receipts-zk prove  witness.json out_dir  [raw|orion]                  proof.bin, public.json, commitment.hex
 //!   receipts-zk verify public.json  proof.bin [raw|orion] [--commitment HEX]
 
@@ -224,6 +225,64 @@ fn commitment_from_proof<C: Config>(proof: &Proof, n_public: usize) -> String {
     hex(&buf)
 }
 
+/// One entry of a `commit-many` list: a tensor name and the path of its weights file.
+#[derive(Deserialize)]
+struct CommitItem {
+    name: String,
+    weights: String,
+}
+
+/// The commitment of one weights file under an already compiled circuit of its shape.
+fn commit_compiled<C: Config>(compiled: &CompileResult<C>, w: &WeightsFile) -> String {
+    let nb = w.k / QK_K;
+    check_weight_values(&w.q4, &w.sc, &w.mn);
+    let full = WitnessFile { m: w.m, k: w.k, q4: w.q4.clone(), sc: w.sc.clone(), mn: w.mn.clone(),
+                             q8: vec![0; w.k], s1: vec![0; w.m * nb], s2: vec![0; w.m * nb] };
+    let n_pack = SIMDField::<C>::PACK_SIZE;
+    let assigns = vec![assignment::<C>(&full); n_pack];
+    let witness = compiled.witness_solver.solve_witnesses(&assigns).expect("witness");
+    let mut circuit = compiled.layered_circuit.export_to_expander_flatten();
+    let (simd_input, simd_public) = witness.to_simd();
+    circuit.layers[0].input_vals = simd_input;
+    circuit.public_input = simd_public;
+    let mpi = MPIConfig::prover_new(None, None);
+    let (params, pkey, _vkey, mut scratch) =
+        expander_pcs_init_testing_only::<C::FieldConfig, C::PCSConfig>(circuit.log_input_size(), &mpi);
+    let c = <C::PCSConfig as ExpanderPCS<C::FieldConfig>>::commit(
+        &params, &mpi, &pkey, &RefMultiLinearPoly::from_ref(&circuit.layers[0].input_vals), &mut scratch)
+        .expect("commit");
+    let mut buf = Vec::new();
+    c.serialize_into(&mut buf).expect("commitment bytes");
+    hex(&buf)
+}
+
+/// Registration of many tensors: the list is sorted by shape and the circuit is compiled once
+/// per (m, k), which is what dominates a single `commit`. Writes {name: commitment} as JSON.
+fn commit_many<C: Config>(list: &[CommitItem], out: &Path) {
+    let mut items: Vec<(usize, usize, &CommitItem)> = list.iter().map(|it| {
+        let w: WeightsFile = serde_json::from_reader(BufReader::new(fs::File::open(&it.weights).expect("weights file"))).expect("weights json");
+        (w.m, w.k, it)
+    }).collect();
+    items.sort_by_key(|(m, k, _)| (*k, *m));
+    let mut result = serde_json::Map::new();
+    let mut compiled: Option<((usize, usize), CompileResult<C>)> = None;
+    for (m, k, it) in items {
+        if compiled.as_ref().map(|(shape, _)| *shape != (m, k)).unwrap_or(true) {
+            let t = Instant::now();
+            let c: CompileResult<C> = compile(&shape_circuit(m, k), CompileOptions::default()).expect("compile");
+            eprintln!("compiled shape m={} k={} in {:.1}s", m, k, t.elapsed().as_secs_f64());
+            compiled = Some(((m, k), c));
+        }
+        let w: WeightsFile = serde_json::from_reader(BufReader::new(fs::File::open(&it.weights).expect("weights file"))).expect("weights json");
+        let t = Instant::now();
+        let h = commit_compiled::<C>(&compiled.as_ref().unwrap().1, &w);
+        eprintln!("  {} ({} x {}) in {:.1}s: {}", it.name, m, k, t.elapsed().as_secs_f64(), &h[..16]);
+        result.insert(it.name.clone(), serde_json::Value::String(h));
+    }
+    serde_json::to_writer(BufWriter::new(fs::File::create(out).expect("out file")), &result).expect("write");
+    println!("{{\"committed\":{}}}", result.len());
+}
+
 /// Registration: the commitment to the private input layer that the circuit of shape (m, k)
 /// gets from these weights. No proof and no activation are involved; the public inputs stay
 /// at zero because they do not enter the private layer.
@@ -365,7 +424,7 @@ fn main() {
         args.drain(i..i + 2);
     }
     if args.len() < 4 {
-        eprintln!("usage: receipts-zk commit weights.json out_dir [orion]\n       receipts-zk prove witness.json out_dir [raw|orion]\n       receipts-zk verify public.json proof.bin [raw|orion] [--commitment HEX]");
+        eprintln!("usage: receipts-zk commit weights.json out_dir [orion]\n       receipts-zk commit-many list.json out.json\n       receipts-zk prove witness.json out_dir [raw|orion]\n       receipts-zk verify public.json proof.bin [raw|orion] [--commitment HEX]");
         std::process::exit(2);
     }
     let config = args.get(4).map(String::as_str).unwrap_or("orion").to_string();
@@ -373,6 +432,10 @@ fn main() {
         "commit" => {
             let w: WeightsFile = serde_json::from_reader(BufReader::new(fs::File::open(&args[2]).expect("weights file"))).expect("weights json");
             commit::<M31OrionConfig>(&w, Path::new(&args[3]), &config);
+        }
+        "commit-many" => {
+            let list: Vec<CommitItem> = serde_json::from_reader(BufReader::new(fs::File::open(&args[2]).expect("list file"))).expect("list json");
+            commit_many::<M31OrionConfig>(&list, Path::new(&args[3]));
         }
         "prove" => {
             let w: WitnessFile = serde_json::from_reader(BufReader::new(fs::File::open(&args[2]).expect("witness file"))).expect("witness json");
