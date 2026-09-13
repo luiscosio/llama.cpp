@@ -49,7 +49,8 @@ lake build
 ./.lake/build/bin/spec-check sha256                                 # FIPS test vectors
 ./.lake/build/bin/spec-check trace receipt.json receipt.trace.json TRUSTED_TOPOLOGY_SHA256
 python3 gen_vectors.py receipt.json --model model.gguf --out vectors.json
-./.lake/build/bin/spec-check vectors vectors.json                  # Q8_K quants, scales, s1, s2, dot, row value
+./.lake/build/bin/spec-check vectors vectors.json                  # Q8_K quants, scales, s1, s2, dot, row value, canonical JSON
+./.lake/build/bin/spec-check vectors vectors.json --emit lean.json # also write what the spec computed, for ../zk/diff_spec.py
 ```
 
 The topology digest must come from a separately trusted reference run for the same model, engine settings and request shape. On a receipt from `llama-receipts` (qwen2.5 1.5B Q4_K_M, CPU, 12 tokens, 32 openings, Sep 11, 2026):
@@ -63,6 +64,8 @@ The topology digest must come from a separately trusted reference run for the sa
 | Data edges | 0 of 10,621 inconsistent |
 | Token inputs, position inputs | 13 of 13 and 728 of 728 match the receipt's tokens |
 | Q4_K rows: Q8_K quants, `d` bit patterns, `s1`, `s2` | all equal to the Python verifier's |
+| Canonical JSON, 14 documents with control characters and non-ASCII | byte-identical to Python's `json.dumps` |
+| The proof circuit (`../zk/diff_spec.py`) on the spec's `s1`, `s2` | accepted for every row; a one-off change rejected |
 | Q4_K row value in `Float` | relative error 0 against the Python float64 reference |
 | Q6_K dot | equal |
 

@@ -78,10 +78,15 @@ def checkTrace (receiptPath tracePath expectedTopology : String) : IO Bool := do
   return root == signedRoot ∧ topologyOk ∧ commitmentsOk ∧ gotSorted == want ∧ openingPolicyOk ∧ e.bad == 0 ∧
     inp.tokensMismatch == 0 ∧ inp.posMismatch == 0 ∧ inp.tokensMatch > 0
 
-/-- Differential test of the arithmetic spec against vectors produced by the Python verifier. -/
-def checkVectors (path : String) : IO Bool := do
+/-- Differential test of the arithmetic spec against vectors produced by the Python verifier.
+    With `emit`, also writes what the spec computed (Q8_K quants, `d` bits, `s1`, `s2`, `Q6_K`
+    dots) so that other implementations, such as the proof circuit, can be checked against
+    the spec rather than against Python. -/
+def checkVectors (path : String) (emit : Option String := none) : IO Bool := do
   let v ← readJson path
   let mut ok := true
+  let mut emitQ4 : Array Json := #[]
+  let mut emitQ6 : Array Json := #[]
   let q4 ← getOr (v.getObjValAs? (Array Json) "q4k")
   for case in q4 do
     let blocksHex ← getOr (case.getObjValAs? String "blocks_hex")
@@ -108,6 +113,8 @@ def checkVectors (path : String) : IO Bool := do
     let good := gotQ8 == wantQ8 ∧ gotD == wantD ∧ gotS1 == wantS1 ∧ gotS2 == wantS2 ∧ rel < 1e-9
     IO.println s!"q4k row: q8 {gotQ8 == wantQ8}, d {gotD == wantD}, s1 {gotS1 == wantS1}, s2 {gotS2 == wantS2}, row rel err {rel}"
     ok := ok ∧ good
+    emitQ4 := emitQ4.push (Json.mkObj [("blocks_hex", toJson blocksHex), ("q8", toJson gotQ8), ("d_bits", toJson gotD),
+                                        ("s1", toJson gotS1), ("s2", toJson gotS2), ("row_value", toJson gotRow)])
   let q6 ← getOr (v.getObjValAs? (Array Json) "q6k")
   for case in q6 do
     let bytes := Sha256.ofHex (← getOr (case.getObjValAs? String "blocks_hex"))
@@ -117,6 +124,7 @@ def checkVectors (path : String) : IO Bool := do
     let gotDot := (Array.range nb).map (fun i => Quant.dotQ6 (Quant.parseQ6K bytes (i * 210)) (Quant.quantizeQ8K (acts.extract (i * 256) ((i + 1) * 256))))
     IO.println s!"q6k row: dot {gotDot == wantDot}"
     ok := ok ∧ gotDot == wantDot
+    emitQ6 := emitQ6.push (Json.mkObj [("dot", toJson gotDot)])
   -- canonical JSON, including string escapes, against Python's json.dumps
   let canon ← getOr (v.getObjValAs? (Array Json) "canonical")
   let mut canonOk := true
@@ -126,6 +134,9 @@ def checkVectors (path : String) : IO Bool := do
     canonOk := canonOk ∧ Sha256.hashHex (Protocol.canonicalBytes value) == want
   IO.println s!"canonical json: {canon.size} documents, {if canonOk then "all match" else "MISMATCH"}"
   ok := ok ∧ canonOk
+  if let some out := emit then
+    IO.FS.writeFile out (Json.mkObj [("q4k", .arr emitQ4), ("q6k", .arr emitQ6)]).compress
+    IO.println s!"wrote {out}"
   return ok
 
 def main (args : List String) : IO UInt32 := do
@@ -136,6 +147,8 @@ def main (args : List String) : IO UInt32 := do
     if ← checkTrace receipt trace expectedTopology then IO.println "trace: ok"; return 0 else IO.println "trace: FAILED"; return 1
   | ["vectors", path] =>
     if ← checkVectors path then IO.println "vectors: ok"; return 0 else IO.println "vectors: FAILED"; return 1
+  | ["vectors", path, "--emit", out] =>
+    if ← checkVectors path (some out) then IO.println "vectors: ok"; return 0 else IO.println "vectors: FAILED"; return 1
   | _ =>
-    IO.println "usage: spec-check sha256 | trace receipt.json trace.json expected-topology-sha256 | vectors vectors.json"
+    IO.println "usage: spec-check sha256 | trace receipt.json trace.json expected-topology-sha256 | vectors vectors.json [--emit lean.json]"
     return 2
