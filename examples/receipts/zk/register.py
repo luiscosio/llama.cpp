@@ -188,7 +188,7 @@ def add_groth16(manifest: dict, store: vt.WeightStore, limit: int | None = None)
         print(f"  groth16 {entry['name']}: {len(groups)} group commitments in {time.time() - t:.1f}s", file=sys.stderr)
     manifest["proof_system"]["groth16"] = {"scheme": GROTH16_SCHEME, "circuit": "groth16/qdot_rows.circom", "rows_per_group": "r{rows}_k{K}: 16 rows for K <= 1536, 8 for K = 2048",
                                            "hiding": "Poseidon over the packed weights with a salt (0 for open weights)", "zero_knowledge": True,
-                                           "setup": "Groth16 phase 2 with one contributor over a locally generated 2^20 powers of tau: proof-of-concept parameters"}
+                                           "setup": "Groth16 phase 2 with one contributor over a locally generated 2^18 powers of tau: proof-of-concept parameters"}
     return n
 
 
