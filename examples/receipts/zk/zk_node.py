@@ -86,6 +86,7 @@ def main(argv=None) -> int:
     p.add_argument("--out", default="zk-out")
     p.add_argument("--binary", default=str(HERE / "target" / "release" / "receipts-zk"))
     p.add_argument("--verify-only", action="store_true", help="verify an existing proof against the registered commitment without proving")
+    p.add_argument("--manifest", help="registration manifest (register.py); the registered commitment is taken from it instead of being computed here")
     a = p.parse_args(argv)
     if a.config == "raw":
         print("the raw configuration ships the witness inside the proof; use it only to debug the circuit")
@@ -142,10 +143,22 @@ def main(argv=None) -> int:
     prove_stats = commit_stats = None
     t_prove = t_commit = 0.0
     committing = a.config != "raw"
+    manifest_commitment = None
+    if a.manifest:
+        manifest = json.loads(Path(a.manifest).read_text())
+        entry = next((t for t in manifest["tensors"] if t["name"] == name), None)
+        if entry is None or "commitment" not in entry:
+            raise SystemExit(f"{name} has no commitment in {a.manifest}")
+        if entry["sha256"] != wsrc["sha256"]:
+            raise SystemExit(f"{name}: the leaf's weight hash is not the registered one")
+        manifest_commitment = entry["commitment"]["value"]
+        (outdir / "registered").mkdir(parents=True, exist_ok=True)
+        (outdir / "registered" / "commitment.hex").write_text(manifest_commitment + "\n")
+        print(f"registered commitment from manifest {manifest['manifest_id'][:16]}... ({manifest['model']['name']}): {manifest_commitment[:16]}...")
     if not a.verify_only:
-        if committing:
+        if committing and manifest_commitment is None:
             # registration: the tensor's commitment from the GGUF alone (here on the same machine; a
-            # deployment publishes it once per model and the verifier pins it)
+            # deployment publishes it once per model and the verifier pins it, see register.py)
             (outdir / "weights.json").write_text(json.dumps(weights))
             t = time.time()
             r = run("commit", str(outdir / "weights.json"), str(outdir / "registered"))

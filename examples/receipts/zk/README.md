@@ -45,6 +45,18 @@ python3 diff_spec.py vectors.json lean.json
 
 `orion` is the configuration that commits. `raw` ships the witness inside the proof: useful to debug the circuit, meaningless as a proof, and `commit` refuses it.
 
+## Registration
+
+`register.py` writes the manifest a verifier pins before checking any proof: the model file (digest, size, architecture and hyperparameters, file type, source and requantization command), every tensor (name, type, shape, bytes, SHA-256), the tokenizer material (a digest over tokens, merges, token types and the pre-tokenizer name), the execution specification, the proof system's identity, and with `--commit` the Orion commitment of every `Q4_K` tensor as the circuit lays it out. The manifest's id is the SHA-256 of its canonical JSON.
+
+```bash
+python3 register.py model.gguf --out manifest.json --commit --source-url URL --source-sha256 HEX --quantize-cmd "llama-quantize ..."
+python3 register.py --check manifest.json --model other-copy.gguf [--commit]   # recompute and compare; exit 0 only if nothing differs
+python3 zk_node.py receipt.json --model model.gguf --index N --manifest manifest.json --out zk-out   # verifier takes the commitment from the manifest
+```
+
+A changed weight, tensor type, shape, tokenizer or execution definition changes the id, and `--check` names the tensor whose digest or commitment differs. The commitments bind but do not hide, and Expander's commitment parameters are its testing-only ones, so the manifest names the scheme and the parameters and a hiding scheme can be added later as another entry.
+
 ## Results
 
 Apple M5, qwen2.5 1.5B Q4_K_M, one activation row from a CPU trace, private weights under a registered Orion commitment (Sep 13, 2026):
