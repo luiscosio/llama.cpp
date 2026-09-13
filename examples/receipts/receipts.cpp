@@ -42,6 +42,7 @@ extern "C" {
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <set>
@@ -966,6 +967,62 @@ struct replay_thresholds {
     double max_gap               = 0.45;
 };
 
+static std::string receipt_structure_error(const json & rec) {
+    if (!rec.is_object() || rec.value("receipt_version", std::string()) != RECEIPT_VERSION) {
+        return "unsupported receipt version";
+    }
+    const auto & prompt = rec.at("request").at("prompt_tokens");
+    const auto & response = rec.at("response").at("tokens");
+    const auto & records = rec.at("response").at("per_token");
+    if (!prompt.is_array() || prompt.empty() || !response.is_array() || response.empty() || !records.is_array() || records.size() != response.size() ||
+        !rec.at("request").at("prompt_text").is_string() || !rec.at("response").at("text").is_string()) {
+        return "malformed receipt";
+    }
+    for (const auto & tokens : { prompt, response }) {
+        for (const auto & token : tokens) {
+            if (!token.is_number_integer() || token.get<int64_t>() < 0 || token.get<int64_t>() > INT32_MAX) {
+                return "invalid token id";
+            }
+        }
+    }
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (records[i].at("token") != response[i] || records[i].at("position") != prompt.size() + i) {
+            return "per-token record differs from token sequence";
+        }
+    }
+    return "";
+}
+
+static std::string receipt_text_error(const llama_vocab * vocab, const json & rec) {
+    const auto prompt = rec.at("request").at("prompt_tokens").get<std::vector<llama_token>>();
+    const auto response = rec.at("response").at("tokens").get<std::vector<llama_token>>();
+    for (const auto & tokens : { prompt, response }) {
+        for (llama_token token : tokens) {
+            if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
+                return "token id outside registered vocabulary";
+            }
+        }
+    }
+    if (common_tokenize(vocab, rec.at("request").at("prompt_text").get<std::string>(), llama_vocab_get_add_bos(vocab), true) != prompt) {
+        return "prompt text does not tokenize to prompt_tokens";
+    }
+    std::string decoded;
+    for (llama_token token : response) {
+        decoded += common_token_to_piece(vocab, token, true);
+    }
+    return decoded == rec.at("response").at("text").get<std::string>() ? "" : "response text does not decode from response tokens";
+}
+
+static int reject_receipt(const std::string & path, const std::string & reason) {
+    json report = { { "verdict", "reject" }, { "reason", reason } };
+    if (!path.empty()) {
+        std::ofstream out(path);
+        out << report.dump(1) << "\n";
+    }
+    LOG_ERR("receipt rejected: %s\n", reason.c_str());
+    return 1;
+}
+
 static int cmd_replay(engine & e, const common_params & params, const std::string & receipt_path, const std::string & report_path) {
     std::ifstream f(receipt_path);
     if (!f) {
@@ -975,6 +1032,14 @@ static int cmd_replay(engine & e, const common_params & params, const std::strin
     json rec;
     f >> rec;
 
+    std::string structural_error = receipt_structure_error(rec);
+    if (!structural_error.empty()) {
+        return reject_receipt(report_path, structural_error);
+    }
+    structural_error = receipt_text_error(e.vocab, rec);
+    if (!structural_error.empty()) {
+        return reject_receipt(report_path, structural_error);
+    }
     json report;
     const std::string file_hash = sha256_file(params.model.path);
     const bool model_ok = file_hash == rec.at("model").at("file_sha256").get<std::string>();
@@ -1114,6 +1179,7 @@ struct extra_args {
     int         openings = 32;
     std::string out;
     std::string replay;
+    std::string check_content;
     std::string report;
     std::string challenge_seed; // hex; empty means Fiat-Shamir from the root and receipt
     std::string claim_model;    // test aid: describe this other GGUF in the receipt and leaves
@@ -1160,6 +1226,8 @@ int main(int argc, char ** argv) {
                 ex.out = v;
             } else if (take_flag(args, i, "--replay", &v)) {
                 ex.replay = v;
+            } else if (take_flag(args, i, "--check-content", &v)) {
+                ex.check_content = v;
             } else if (take_flag(args, i, "--report", &v)) {
                 ex.report = v;
             } else if (take_flag(args, i, "--challenge-seed", &v)) {
@@ -1179,6 +1247,48 @@ int main(int argc, char ** argv) {
     common_init();
     if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_COMMON, print_usage)) {
         return 1;
+    }
+    if (!ex.check_content.empty()) {
+        try {
+            json rec;
+            if (ex.check_content == "-") {
+                std::cin >> rec;
+            } else {
+                std::ifstream file(ex.check_content);
+                file >> rec;
+            }
+            std::string error = receipt_structure_error(rec);
+            if (error.empty()) {
+                auto mp = llama_model_default_params();
+                mp.vocab_only = true;
+                mp.n_gpu_layers = 0;
+                llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mp);
+                if (!model) { throw std::runtime_error("cannot load vocabulary"); }
+                try {
+                    error = receipt_text_error(llama_model_get_vocab(model), rec);
+                } catch (...) {
+                    llama_model_free(model);
+                    throw;
+                }
+                llama_model_free(model);
+            }
+            std::cout << json({ { "accept", error.empty() }, { "reason", error } }).dump() << "\n";
+            return error.empty() ? 0 : 1;
+        } catch (const std::exception & error) {
+            LOG_ERR("invalid receipt content: %s\n", error.what());
+            return 1;
+        }
+    }
+    if (!ex.replay.empty()) {
+        try {
+            json rec;
+            std::ifstream file(ex.replay);
+            file >> rec;
+            const auto error = receipt_structure_error(rec);
+            if (!error.empty()) { return reject_receipt(ex.report, error); }
+        } catch (const std::exception & error) {
+            return reject_receipt(ex.report, std::string("malformed receipt: ") + error.what());
+        }
     }
     if (ex.replay.empty() && ex.out.empty()) {
         LOG_ERR("--out receipt.json is required when proving\n");

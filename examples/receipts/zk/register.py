@@ -12,7 +12,8 @@ statement fixes, the proof system's identity, and, with --commit, the Orion comm
 Q4_K tensor as the circuit of `receipts-zk` lays it out: the value `receipts-zk verify
 --commitment` will demand. The manifest's id is the SHA-256 of its canonical JSON.
 
---check recomputes everything from another copy of the GGUF and reports what differs, so a
+--check validates GGUF metadata and proof material identities; --commit and --groth16
+select commitment recomputation. It reports the number checked, so a
 registration can be validated independently. Changing a weight, a tensor's type or shape, the
 tokenizer or the execution specification changes the id.
 
@@ -38,6 +39,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(1, str(HERE.parents[3] / "gguf-py"))
+from registration_schema import validate_manifest, VERSION
 import verify_trace as vt  # noqa: E402
 from gguf import GGUFReader  # noqa: E402
 
@@ -192,6 +194,17 @@ def add_groth16(manifest: dict, store: vt.WeightStore, limit: int | None = None)
     return n
 
 
+def pin_groth16(manifest: dict, circuits_dir: Path) -> None:
+    ps = manifest["proof_system"].get("groth16")
+    if ps is None:
+        return
+    names = {t["groth16"]["circuit"] for t in manifest["tensors"] if t.get("groth16")}
+    ps["verification_keys"] = {name: hashlib.sha256(canonical(json.loads((circuits_dir / name / "verification_key.json").read_text()))).hexdigest() for name in sorted(names)}
+    ps["circuit_sha256"] = hashlib.sha256((HERE / "groth16/qdot_rows.circom").read_bytes()).hexdigest()
+    ps["verifier_sha256"] = hashlib.sha256((HERE / "groth16/verify.js").read_bytes()).hexdigest()
+    ps["setup_sha256"] = "a6985229b8a639691dfb24174b8374c1686d50135a5eeacdeb8d8d6c209c67f1"
+
+
 def build(a) -> dict:
     model = Path(a.model)
     store = vt.WeightStore(str(model))
@@ -209,7 +222,7 @@ def build(a) -> dict:
         n_committed = add_orion(tensors, store, a.binary, a.limit)
         commit_total = time.time() - t0
     manifest = {
-        "manifest_version": "registration/v0",
+        "manifest_version": VERSION,
         "created_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "model": {
             "name": field_scalar(reader, "general.name"), "architecture": arch, "file_type": field_scalar(reader, "general.file_type"),
@@ -230,12 +243,19 @@ def build(a) -> dict:
     if a.groth16:
         n = add_groth16(manifest, store, a.limit)
         manifest["registration"]["groth16_tensors"] = n
+    pin_groth16(manifest, Path(a.circuits_dir))
+    manifest["manifest_version"] = VERSION
     manifest["manifest_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
+    validate_manifest(manifest)
     return manifest
 
 
 def augment(a) -> int:
     manifest = json.loads(Path(a.augment).read_text())
+    validation = argparse.Namespace(**vars(a))
+    validation.check, validation.commit, validation.groth16 = a.augment, False, False
+    if check(validation) != 0:
+        return 1
     manifest.pop("manifest_id", None)
     store = vt.WeightStore(a.model)
     if vt.sha256_file(a.model) != manifest["model"]["file_sha256"]:
@@ -247,6 +267,8 @@ def augment(a) -> int:
         n_o = add_orion(manifest["tensors"], store, a.binary, a.limit)
         manifest["registration"]["committed_tensors"] = sum(1 for e in manifest["tensors"] if e.get("commitment"))
         n += n_o
+    pin_groth16(manifest, Path(a.circuits_dir))
+    manifest["manifest_version"] = VERSION
     manifest["manifest_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
     Path(a.out or a.augment).write_text(json.dumps(manifest, indent=1))
     print(f"manifest {manifest['manifest_id'][:16]}...: {n} commitments added ({total} tensors with Groth16, "
@@ -256,19 +278,42 @@ def augment(a) -> int:
 
 def check(a) -> int:
     manifest = json.loads(Path(a.check).read_text())
-    mid = manifest.pop("manifest_id")
+    try:
+        validate_manifest(manifest)
+    except ValueError as e:
+        print(f"manifest: INVALID ({e})")
+        return 1
     problems = []
-    if hashlib.sha256(canonical(manifest)).hexdigest() != mid:
-        problems.append("manifest_id does not match the manifest's content")
     store = vt.WeightStore(a.model)
     file_hash = vt.sha256_file(a.model)
     reader = GGUFReader(a.model)
     if file_hash != manifest["model"]["file_sha256"]:
         problems.append(f"file digest {file_hash[:16]} vs registered {manifest['model']['file_sha256'][:16]}")
+    arch = field_scalar(reader, "general.architecture")
+    expected_model = {"name": field_scalar(reader, "general.name"), "architecture": arch,
+                      "file_type": field_scalar(reader, "general.file_type"), "file_bytes": Path(a.model).stat().st_size,
+                      "n_tensors": len(reader.tensors), "hparams": hparams(reader, arch)}
+    for key, value in expected_model.items():
+        if manifest["model"].get(key) != value:
+            problems.append(f"model {key} differs from GGUF")
     by_name = {t.name: t for t in reader.tensors}
-    if len(by_name) != len(manifest["tensors"]):
-        problems.append(f"{len(by_name)} tensors in the file, {len(manifest['tensors'])} registered")
+    if [t["name"] for t in manifest["tensors"]] != list(by_name):
+        problems.append("tensor table is not the complete GGUF mapping in file order")
+    if manifest["tokenizer"] != tokenizer_identity(reader):
+        problems.append("tokenizer identity differs")
+    if manifest["proof_system"].get("groth16"):
+        expected = json.loads(json.dumps(manifest))
+        pin_groth16(expected, Path(a.circuits_dir))
+        for key in ("verification_keys", "circuit_sha256", "setup_sha256", "verifier_sha256"):
+            if manifest["proof_system"]["groth16"][key] != expected["proof_system"]["groth16"][key]:
+                problems.append(f"Groth16 {key} differs from installed materials")
+    if problems:
+        for problem in problems:
+            print("  PROBLEM:", problem)
+        print("manifest: INVALID")
+        return 1
     n_commit_checked = 0
+    n_groth16_checked = 0
     with tempfile.TemporaryDirectory() as tmp:
         for entry in manifest["tensors"]:
             t = by_name.get(entry["name"])
@@ -276,10 +321,13 @@ def check(a) -> int:
                 problems.append(f"{entry['name']}: missing from the file"); continue
             if t.tensor_type.name != entry["type"] or [int(x) for x in t.shape] != entry["shape"]:
                 problems.append(f"{entry['name']}: type or shape differs")
+            if int(t.n_bytes) != entry["n_bytes"]:
+                problems.append(f"{t.name}: byte size differs")
             if store.hashes[t.name] != entry["sha256"]:
                 problems.append(f"{entry['name']}: digest differs")
             g16 = entry.get("groth16")
-            if g16 and a.groth16 and (a.limit is None or n_commit_checked < a.limit):
+            if g16 and a.groth16 and (a.limit is None or n_groth16_checked < a.limit):
+                n_groth16_checked += 1
                 if groth16_commitments(store, t.name, entry["shape"][1], g16["rows_per_group"], int(g16.get("salt", "0"))) != g16["groups"]:
                     problems.append(f"{entry['name']}: groth16 group commitments differ")
             c = entry.get("commitment")
@@ -292,10 +340,10 @@ def check(a) -> int:
     if tokenizer_identity(reader)["sha256"] != manifest["tokenizer"]["sha256"]:
         problems.append("tokenizer material differs")
     n_g16 = sum(1 for e in manifest["tensors"] if e.get("groth16")) if a.groth16 else 0
-    print(f"checked {len(manifest['tensors'])} tensors, {n_commit_checked} Orion commitments recomputed, {min(n_g16, a.limit) if a.limit else n_g16} tensors' Groth16 group commitments recomputed")
+    print(f"checked {len(manifest['tensors'])} tensors, {n_commit_checked} Orion commitments recomputed, {n_groth16_checked} tensors' Groth16 group commitments recomputed")
     for p in problems:
         print("  PROBLEM:", p)
-    print("manifest:", "valid" if not problems else "INVALID")
+    print("manifest:", "valid for the checks requested (commitments not recomputed unless selected)" if not problems else "INVALID")
     return 0 if not problems else 1
 
 
@@ -314,8 +362,11 @@ def main(argv=None) -> int:
     p.add_argument("--source-sha256")
     p.add_argument("--quantize-cmd")
     p.add_argument("--llama-rev")
+    p.add_argument("--circuits-dir", default=str(HERE.parents[4] / "registry/circuits"))
     p.add_argument("--registrar", help="who registers (default: this machine's hostname)")
     a = p.parse_args(argv)
+    if a.limit is not None and a.limit <= 0:
+        p.error("--limit must be positive")
     if a.augment:
         a.model = a.model_opt or a.model
         if not a.model:
