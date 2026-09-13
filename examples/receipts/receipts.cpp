@@ -884,6 +884,13 @@ static json engine_info(const common_params & params) {
                             { "n_batch", params.n_batch }, { "n_ubatch", params.n_ubatch } } } };
 }
 
+static std::string utf8_display_text(const std::string & bytes) {
+    // Token pieces are bytes. Decode the complete stream so split characters survive;
+    // an incomplete final character (or malformed sequence) is displayed as U+FFFD.
+    // Exact token IDs remain separately committed in the receipt.
+    return json::parse(json(bytes).dump(-1, ' ', false, json::error_handler_t::replace)).get<std::string>();
+}
+
 static json build_receipt(engine & e, const common_params & params, const model_commit & mc, const std::string & prompt_text,
                           const std::vector<llama_token> & prompt_tokens, const sampler_cfg & cfg, const std::vector<token_record> & records,
                           int n_predict) {
@@ -895,6 +902,7 @@ static json build_receipt(engine & e, const common_params & params, const model_
         per_token.push_back(r.to_json());
         text += common_token_to_piece(e.ctx, r.token, true);
     }
+    text = utf8_display_text(text);
     const json commit_doc = { { "prompt", prompt_tokens }, { "response", tokens } };
     const json request = { { "prompt_text", prompt_text }, { "prompt_tokens", prompt_tokens }, { "sampler", cfg.to_json() }, { "n_predict", n_predict } };
     const json response = { { "tokens", tokens }, { "text", text }, { "per_token", per_token } };
@@ -1010,7 +1018,7 @@ static std::string receipt_text_error(const llama_vocab * vocab, const json & re
     for (llama_token token : response) {
         decoded += common_token_to_piece(vocab, token, true);
     }
-    return decoded == rec.at("response").at("text").get<std::string>() ? "" : "response text does not decode from response tokens";
+    return utf8_display_text(decoded) == rec.at("response").at("text").get<std::string>() ? "" : "response text does not decode from response tokens";
 }
 
 static int reject_receipt(const std::string & path, const std::string & reason) {
