@@ -45,6 +45,20 @@ python3 diff_spec.py vectors.json lean.json
 
 `orion` is the configuration that commits. `raw` ships the witness inside the proof: useful to debug the circuit, meaningless as a proof, and `commit` refuses it.
 
+## Zero-knowledge proofs of the same statement (Groth16)
+
+Expander has no zero-knowledge layer, so `groth16/` proves the same integer core with an established one: a circom circuit (`qdot_rows.circom`) and Groth16 through snarkjs. The weights of a group of rows (64 rows for K up to 1536, 32 for K = 2048) are private inputs as bits, so every nibble and six-bit field is in range by construction; a Poseidon chain over the packed weights and a salt is the public commitment; the activation quants and the per-block sums are public inputs. Groth16 proofs are zero-knowledge and about 800 bytes, and `snarkjs.groth16.verify` runs in a browser.
+
+```bash
+cd groth16 && npm install                                   # snarkjs, circomlib, circomlibjs; circom from cargo install --git https://github.com/iden3/circom
+# one instance per (rows, K); build/r64_k1536, build/r64_k1024, build/r32_k2048 are the shapes of the two models here
+./setup.sh build/r64_k1536 ptau/pot20_final.ptau            # Groth16 setup and one phase-2 contribution: main_final.zkey, verification_key.json
+python3 groth16_node.py receipt.json --model model.gguf --index N [--manifest manifest.json] [--groups 0,1] --out groth16-out
+python3 ../register.py --augment manifest.json --model model.gguf --groth16   # one Poseidon commitment per row group, per Q4_K tensor
+```
+
+`groth16_node.py` proves each row group of the opened node, verifies it, checks the proof's commitment against the registered one (from `--manifest`, or recomputed with `commit.js`), and runs the negatives: a tampered public sum and another group's commitment. The powers of tau are generated locally (`snarkjs powersoftau`, 2^20) because the public Hermez mirrors no longer serve the files; together with the single phase-2 contribution these are proof-of-concept parameters, and a deployment would use a ceremony. What the proof does not cover is unchanged: the float scales, the other operations of the token, and the sampled output.
+
 ## Registration
 
 `register.py` writes the manifest a verifier pins before checking any proof: the model file (digest, size, architecture and hyperparameters, file type, source and requantization command), every tensor (name, type, shape, bytes, SHA-256), the tokenizer material (a digest over tokens, merges, token types and the pre-tokenizer name), the execution specification, the proof system's identity, and with `--commit` the Orion commitment of every `Q4_K` tensor as the circuit lays it out. The manifest's id is the SHA-256 of its canonical JSON.

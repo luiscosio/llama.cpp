@@ -43,6 +43,17 @@ from gguf import GGUFReader  # noqa: E402
 
 STATEMENT_VERSION = "stmt/v0"
 COMMITMENT_SCHEME = "expander-orion/m31x16/receipts-zk-qdot"
+GROTH16_SCHEME = "groth16-poseidon/bn254/qdot_rows"
+GROTH16_MAX_NIBBLES = 64 * 1536  # what fits a 2^20 Groth16 setup with room to spare
+
+
+def groth16_rows(k: int) -> int:
+    """Rows per Groth16 proof for a tensor with K columns: the largest power of two with at most
+    GROTH16_MAX_NIBBLES nibbles per group, capped at 64."""
+    rows = 1
+    while rows * 2 <= 64 and rows * 2 * k <= GROTH16_MAX_NIBBLES:
+        rows *= 2
+    return rows
 
 
 def canonical(obj) -> bytes:
@@ -115,6 +126,38 @@ def commit_tensor(binary: str, store: vt.WeightStore, name: str, m: int, k: int,
     return json.loads(r.stdout.strip().splitlines()[-1])["commitment"], time.time() - t
 
 
+def groth16_commitments(store: vt.WeightStore, name: str, m: int, rows: int, salt: int = 0) -> list[str]:
+    """Poseidon commitment of every group of `rows` rows, as groth16/commit.js and qdot_rows.circom compute it."""
+    _, _, sc, mn, q4 = vt.unpack_q4_k(store.blocks(name))
+    q4 = q4.reshape(m, -1)
+    groups = [{"q4": q4[g:g + rows].reshape(-1).astype(int).tolist(), "sc": sc[g:g + rows].reshape(-1).astype(int).tolist(),
+               "mn": mn[g:g + rows].reshape(-1).astype(int).tolist()} for g in range(0, m, rows)]
+    r = subprocess.run(["node", str(HERE / "groth16" / "commit.js")], input=json.dumps({"salt": str(salt), "groups": groups}),
+                       capture_output=True, text=True, check=True)
+    return json.loads(r.stdout.strip())
+
+
+def add_groth16(manifest: dict, store: vt.WeightStore, limit: int | None = None) -> int:
+    n = 0
+    for entry in manifest["tensors"]:
+        shape = entry["shape"]
+        rows = groth16_rows(shape[0]) if len(shape) == 2 else 0
+        if entry["type"] != "Q4_K" or len(shape) != 2 or shape[0] % 256 != 0 or shape[1] % rows != 0:
+            continue
+        if limit is not None and n >= limit:
+            break
+        t = time.time()
+        groups = groth16_commitments(store, entry["name"], shape[1], rows)
+        entry["groth16"] = {"scheme": GROTH16_SCHEME, "rows_per_group": rows, "circuit": f"r{rows}_k{shape[0]}",
+                            "salt": "0", "groups": groups, "seconds": round(time.time() - t, 2)}
+        n += 1
+        print(f"  groth16 {entry['name']}: {len(groups)} group commitments in {time.time() - t:.1f}s", file=sys.stderr)
+    manifest["proof_system"]["groth16"] = {"scheme": GROTH16_SCHEME, "circuit": "groth16/qdot_rows.circom", "rows_per_group": "r{rows}_k{K}: 64 rows for K <= 1536, 32 for K = 2048",
+                                           "hiding": "Poseidon over the packed weights with a salt (0 for open weights)", "zero_knowledge": True,
+                                           "setup": "Groth16 phase 2 with one contributor over a locally generated 2^20 powers of tau: proof-of-concept parameters"}
+    return n
+
+
 def build(a) -> dict:
     model = Path(a.model)
     store = vt.WeightStore(str(model))
@@ -155,8 +198,25 @@ def build(a) -> dict:
                          "zero_knowledge": False},
         "registration": {"registrar": platform.node(), "committed_tensors": n_committed, "commit_seconds": round(commit_total, 1)},
     }
+    if a.groth16:
+        n = add_groth16(manifest, store, a.limit)
+        manifest["registration"]["groth16_tensors"] = n
     manifest["manifest_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
     return manifest
+
+
+def augment(a) -> int:
+    manifest = json.loads(Path(a.augment).read_text())
+    manifest.pop("manifest_id", None)
+    store = vt.WeightStore(a.model)
+    if vt.sha256_file(a.model) != manifest["model"]["file_sha256"]:
+        print("this GGUF is not the registered file"); return 1
+    n = add_groth16(manifest, store, a.limit)
+    manifest["registration"]["groth16_tensors"] = n
+    manifest["manifest_id"] = hashlib.sha256(canonical(manifest)).hexdigest()
+    Path(a.out or a.augment).write_text(json.dumps(manifest, indent=1))
+    print(f"manifest {manifest['manifest_id'][:16]}...: groth16 commitments added for {n} tensors, written to {a.out or a.augment}")
+    return 0
 
 
 def check(a) -> int:
@@ -183,6 +243,10 @@ def check(a) -> int:
                 problems.append(f"{entry['name']}: type or shape differs")
             if store.hashes[t.name] != entry["sha256"]:
                 problems.append(f"{entry['name']}: digest differs")
+            g16 = entry.get("groth16")
+            if g16 and a.groth16 and (a.limit is None or n_commit_checked < a.limit):
+                if groth16_commitments(store, t.name, entry["shape"][1], g16["rows_per_group"], int(g16.get("salt", "0"))) != g16["groups"]:
+                    problems.append(f"{entry['name']}: groth16 group commitments differ")
             c = entry.get("commitment")
             if c and a.commit and (a.limit is None or n_commit_checked < a.limit):
                 k, m = entry["shape"][0], entry["shape"][1]
@@ -192,7 +256,8 @@ def check(a) -> int:
                     problems.append(f"{entry['name']}: commitment differs")
     if tokenizer_identity(reader)["sha256"] != manifest["tokenizer"]["sha256"]:
         problems.append("tokenizer material differs")
-    print(f"checked {len(manifest['tensors'])} tensors, {n_commit_checked} commitments recomputed")
+    n_g16 = sum(1 for e in manifest["tensors"] if e.get("groth16")) if a.groth16 else 0
+    print(f"checked {len(manifest['tensors'])} tensors, {n_commit_checked} Orion commitments recomputed, {min(n_g16, a.limit) if a.limit else n_g16} tensors' Groth16 group commitments recomputed")
     for p in problems:
         print("  PROBLEM:", p)
     print("manifest:", "valid" if not problems else "INVALID")
@@ -206,6 +271,8 @@ def main(argv=None) -> int:
     p.add_argument("--check", help="validate this manifest against --model")
     p.add_argument("--model", dest="model_opt")
     p.add_argument("--commit", action="store_true", help="also compute the Orion commitment of every Q4_K tensor (or check them)")
+    p.add_argument("--groth16", action="store_true", help="also compute the Poseidon group commitments the Groth16 circuit uses (or check them)")
+    p.add_argument("--augment", help="add --groth16 commitments to this existing manifest (with --model), writing --out or in place")
     p.add_argument("--limit", type=int, help="commit or check only the first N Q4_K tensors (testing)")
     p.add_argument("--binary", default=str(HERE / "target" / "release" / "receipts-zk"))
     p.add_argument("--source-url")
@@ -213,6 +280,11 @@ def main(argv=None) -> int:
     p.add_argument("--quantize-cmd")
     p.add_argument("--llama-rev")
     a = p.parse_args(argv)
+    if a.augment:
+        a.model = a.model_opt or a.model
+        if not a.model:
+            p.error("--augment needs --model")
+        return augment(a)
     if a.check:
         a.model = a.model_opt or a.model
         if not a.model:
