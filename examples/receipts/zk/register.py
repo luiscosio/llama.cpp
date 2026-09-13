@@ -225,7 +225,7 @@ def build(a) -> dict:
                          "compiler_rev": "b5a94702d0fc3304f117d0cdba307517b8b3f6b8", "receipts_zk_rev": git_rev(HERE),
                          "commitment": {"scheme": COMMITMENT_SCHEME, "hiding": False, "parameters": "expander_pcs_init_testing_only, fixed test RNG, one commitment per Q4_K tensor over the circuit's private input layer (16 identical SIMD lanes)"},
                          "zero_knowledge": False},
-        "registration": {"registrar": platform.node(), "committed_tensors": n_committed, "commit_seconds": round(commit_total, 1)},
+        "registration": {"registrar": a.registrar or platform.node(), "committed_tensors": n_committed, "commit_seconds": round(commit_total, 1)},
     }
     if a.groth16:
         n = add_groth16(manifest, store, a.limit)
@@ -314,6 +314,7 @@ def main(argv=None) -> int:
     p.add_argument("--source-sha256")
     p.add_argument("--quantize-cmd")
     p.add_argument("--llama-rev")
+    p.add_argument("--registrar", help="who registers (default: this machine's hostname)")
     a = p.parse_args(argv)
     if a.augment:
         a.model = a.model_opt or a.model
