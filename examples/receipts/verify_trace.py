@@ -30,7 +30,7 @@ Not covered: a cheat confined to one node is caught only if that node is sampled
 signature (sign and check it with your own key tooling), and the verifier still needs the model
 file for its weights.
 
-Only numpy and the repo's gguf-py are required.
+Requires numpy, the repo's gguf-py and the built llama-receipts vocabulary checker (no inference).
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import time
 import zlib
@@ -664,6 +665,22 @@ def classify_input(leaf: dict, i: int) -> str | None:
 # the verifier
 # ----------------------------------------------------------------------------------------------
 
+def verify_text_content(rec: dict, model_path: str) -> tuple[bool, str]:
+    binary = Path(__file__).resolve().parents[2] / "build/bin/llama-receipts"
+    try:
+        result = subprocess.run([str(binary), "-m", str(model_path), "--check-content", "-"], input=json.dumps(rec),
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return True, "prompt tokenization and response token pieces match"
+        try:
+            reason = json.loads(result.stdout)["reason"]
+        except (ValueError, KeyError):
+            reason = "receipt content check failed"
+        return False, reason
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "vocabulary checker unavailable; build llama-receipts before verifying"
+
+
 def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes = b"", expected_topology_sha256: str | None = None,
                  min_openings: int = 32) -> dict:
     t0 = time.time()
@@ -701,6 +718,11 @@ def verify_trace(rec: dict, tdoc: dict, model_path: str, challenge_seed: bytes =
     content_commitment = sha256(canonical_bytes({"prompt_text": rec["request"]["prompt_text"], "response_text": rec["response"]["text"]}))
     check("content_commitments", token_commitment == rec["commitments"].get("tokens_sha256") and
           content_commitment == rec["commitments"].get("content_sha256"), "token and human-readable receipt content")
+
+    text_ok, text_reason = verify_text_content(rec, model_path)
+    check("text_tokens", text_ok, text_reason)
+    if not text_ok:
+        return {"verdict": "reject", "reason": text_reason, "checks": checks}
 
     binding = bytes.fromhex(rec["commitments"]["tokens_sha256"]) + bytes.fromhex(rec["commitments"]["content_sha256"]) + bytes.fromhex(rec["model"]["file_sha256"])
     ch = tdoc.get("challenge", {})

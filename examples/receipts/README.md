@@ -5,7 +5,7 @@ Inference receipts for llama.cpp, with a Merkle-committed activation trace that 
 Two programs:
 
 - `llama-receipts` (C++). Generates text with a replayable sampler and writes a receipt. With `--trace` it also hashes every tensor the forward pass computes into one Merkle tree and writes a sidecar with the leaves and openings for a sampled set of nodes. It can also replay a receipt by re-execution.
-- `verify_trace.py` (Python, numpy and the repo's `gguf-py` only). Checks a trace sidecar against its receipt and the GGUF file, without llama.cpp and without a GPU.
+- `verify_trace.py` (Python, numpy, the repo's `gguf-py` and the built native vocabulary checker). Checks a trace sidecar against its receipt and the GGUF file without running inference or using a GPU.
 
 Neither is a zero-knowledge proof. The verifier holds the weights. What this gives is a signed-able record of exactly what ran, a cheap way to catch a prover that ran a different or cheaper model, and the commit-and-open structure a proof system would slot into.
 
@@ -132,3 +132,5 @@ A larger matrix on the same design, run with a Python prototype of this tracer o
 ## Relation to other work
 
 Signed receipts with model hash, seed and decode policy, checked by byte-equality replay, exist in several projects. Tolerant recompute with a per-token metric is Token-DiFR (Karvonen, Rinberg et al., 2025); the two-regime rule in `--replay` (strict when logits hashes match, tolerant otherwise) and the hash-derived draws are this tool's variant of it. Commit-and-open verification of a forward pass at layer granularity is "Lightweight Cryptographic Proofs of Inference" (Anchuri, Campanelli, Gennaro et al., SaTML 2026); this is the same shape at GGML node granularity on the engine's real kernels, with every edge of the graph bound and the inputs regenerated from the receipt.
+
+Receipt content checks: replay rejects unknown receipt versions and verifies prompt tokenization and response token pieces (including special tokens). `llama-receipts -m model.gguf --check-content receipt.json` performs only structure and text/token checks using a vocabulary-only load; it does not verify inference or the model file commitment. The Python trace verifier calls this helper and separately checks the GGUF digest and trace. Build the native executable before running `verify_trace.py`.
