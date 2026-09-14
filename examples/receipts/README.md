@@ -123,6 +123,7 @@ A larger matrix on the same design, run with a Python prototype of this tracer o
 ## Limits
 
 - **Sampling bound.** A cheat confined to one node with consistent edges is caught only if that node or a consumer is sampled: with `k` openings over `N` leaves the miss probability is about `1 - (1 + consumers) k / N`. Dense cheats (wrong weights, wrong model, wrong arithmetic everywhere) are what the trace is built for; a targeted single-node fabrication needs full replay or a proof system.
+- **Topology policy.** A verifier must provision the expected topology digest independently. The digest is request-shape-specific; accepting the value from the receipt under review removes this protection.
 - **Sampler tampering is out of scope for the trace.** Temperature, greedy or seed tampering leave every activation honest. The trace ties its logits to the receipt; `--replay` judges the sampler.
 - **The verifier holds the weights.** It needs the GGUF to bind weights and re-execute matmuls. Not zero-knowledge.
 - **Cost.** Observing every node splits the graph into single-node dispatches with a sync each. Tracing a 12-token generation of this 1.5B model takes about 3 seconds per pass on Metal; hashing the model file once is another 4 seconds. Trace verification takes 2 to 3 seconds and is dominated by dequantizing the opened weights; at this model size a replay is cheaper. The trace verifier's cost is fixed by `k`, replay grows with the model.
