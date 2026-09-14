@@ -7,8 +7,8 @@
 The node's weight rows are proven in groups of ROWS rows. For each group the circuit
 (qdot_rows.circom) proves ggml's Q4_K x Q8_K integer core with the weights private and bound
 to a Poseidon commitment (public output); the activation quants and the per-block sums are
-public inputs. Groth16 proofs are zero-knowledge: nothing about the weights leaves the prover
-beyond the commitment. Registration publishes one commitment per group (register.py --groth16);
+public inputs. Groth16 hides the private witness beyond this full public statement;
+activation quants and sums remain public. Registration publishes one commitment per group (register.py --groth16);
 the verifier compares the proof's commitment with the registered one for that group.
 
 Negative cases, per group: a tampered public sum, a proof made with one changed nibble and
@@ -69,7 +69,12 @@ def main(argv=None) -> int:
     p.add_argument("--manifest", help="registration manifest with groth16 group commitments; the verifier takes the registered value from it")
     p.add_argument("--salt", type=int, default=0)
     p.add_argument("--out", default="groth16-out")
+    p.add_argument("--progress-json", action="store_true", help="emit stage events for a local interface")
     a = p.parse_args(argv)
+
+    def progress(stage, group):
+        if a.progress_json:
+            print(json.dumps({"event": "progress", "stage": stage, "group": group}), flush=True)
 
     rec = json.loads(Path(a.receipt).read_text())
     tpath = Path(a.trace) if a.trace else Path(a.receipt).with_name(Path(a.receipt).name.removesuffix(".json") + ".trace.json")
@@ -107,6 +112,8 @@ def main(argv=None) -> int:
     registered = None
     if a.manifest:
         man = json.loads(Path(a.manifest).read_text())
+        from registration_schema import validate_manifest
+        validate_manifest(man)
         entry = next((t for t in man["tensors"] if t["name"] == name), None)
         if entry is None or "groth16" not in entry:
             raise SystemExit(f"{name} has no groth16 commitments in {a.manifest}")
@@ -117,6 +124,8 @@ def main(argv=None) -> int:
     outdir = Path(a.out)
     outdir.mkdir(parents=True, exist_ok=True)
     groups = [int(g) for g in a.groups.split(",")] if a.groups else list(range(n_groups))
+    if not groups or len(set(groups)) != len(groups) or any(g < 0 or g >= n_groups for g in groups):
+        raise SystemExit("groups must be distinct indices inside the tensor")
     results = []
     for g in groups:
         rows = slice(g * a.rows, (g + 1) * a.rows)
@@ -126,12 +135,14 @@ def main(argv=None) -> int:
         inp = {"q4bits": bits(q4g, 4), "scbits": bits(scg, 6), "mnbits": bits(mng, 6), "salt": str(a.salt),
                "q8": [fe(x) for x in q8], "s1": [fe(x) for x in s1[rows].reshape(-1)], "s2": [fe(x) for x in s2[rows].reshape(-1)]}
         (gdir / "input.json").write_text(json.dumps(inp))
+        progress("witness", g)
         t = time.time()
         r = snarkjs("wtns", "calculate", str(wasm), str(gdir / "input.json"), str(gdir / "witness.wtns"))
         if r.returncode != 0:
             print(f"group {g}: witness generation failed (the inputs do not satisfy the circuit)\n{r.stderr[-400:]}")
             return 1
         t_wit = time.time() - t
+        progress("proving", g)
         t = time.time()
         r = snarkjs("groth16", "prove", str(zkey), str(gdir / "witness.wtns"), str(gdir / "proof.json"), str(gdir / "public.json"))
         if r.returncode != 0:
@@ -144,10 +155,15 @@ def main(argv=None) -> int:
         commitment = public[0]
         expected = registered[g] if registered else commitment_js(q4g, scg, mng, a.salt)
         bound = commitment == expected
+        progress("checking", g)
         t = time.time()
-        v = snarkjs("groth16", "verify", str(vkey), str(gdir / "public.json"), str(gdir / "proof.json"))
+        if a.manifest:
+            v = subprocess.run(["node", str(HERE / "verify_package.cjs"), str(vkey), a.manifest, name, str(g), str(gdir)], capture_output=True, text=True)
+            accept = v.returncode == 0 and json.loads(v.stdout).get("accept") is True
+        else:
+            v = snarkjs("groth16", "verify", str(vkey), str(gdir / "public.json"), str(gdir / "proof.json"))
+            accept = v.returncode == 0 and "OK" in v.stdout
         t_verify = time.time() - t
-        accept = v.returncode == 0 and "OK" in v.stdout
         # negative 1: tampered public sum
         bad = list(public)
         bad[1 + K] = fe(int(bad[1 + K]) + 1)
@@ -160,7 +176,7 @@ def main(argv=None) -> int:
         other_bound = commitment == other
         proof_bytes = (gdir / "proof.json").stat().st_size + (gdir / "public.json").stat().st_size
         print(f"group {g}: witness {t_wit:.1f}s, prove {t_prove:.1f}s, verify {t_verify:.2f}s, package {proof_bytes} bytes; "
-              f"proof {'ACCEPT' if accept else 'REJECT'}; commitment {'matches' if bound else 'DIFFERS FROM'} the registered one; "
+              f"proof {'ACCEPT' if accept else 'REJECT'}; commitment {'matches' if bound else 'DIFFERS FROM'} the {'registered' if registered else 'locally recomputed'} one; "
               f"tampered sum {'accepted' if tampered else 'rejected'}; other group's commitment {'accepted' if other_bound else 'rejected'}")
         results.append({"group": g, "witness_seconds": round(t_wit, 2), "prove_seconds": round(t_prove, 2), "verify_seconds": round(t_verify, 3),
                         "package_bytes": proof_bytes, "accept": accept, "commitment": commitment, "bound": bound,
@@ -170,9 +186,11 @@ def main(argv=None) -> int:
                "float_step_error": float(vt.normalized_error(
                    vt.tensor_from_bytes(vt.decode_blob(o["out"], enc), leaf["out"]["type"], leaf["out"]["ne"], leaf["out"]["nb"], leaf["out"]["offset"]).reshape(-1, M)[0],
                    (d_a[0][None, :] * d_w * s1 - d_a[0][None, :] * dmin * s2).sum(axis=1)))}
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
     print(f"float step: max|out - ref| / max|ref| = {summary['float_step_error']:.2e}")
-    print("RESULT:", "zero-knowledge proofs verify against the registered commitments; negatives rejected" if ok else "FAILED")
+    summary["verification_policy"] = "registered shared policy" if a.manifest else "pairing and local commitment only; shared registration/range policy skipped"
+    (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
+    print("RESULT:", ("proofs pass the shared registration and range policy; negatives rejected" if a.manifest else
+                       "pairings and locally recomputed commitments match; shared registration/range policy SKIPPED") if ok else "FAILED")
     return 0 if ok else 1
 
 

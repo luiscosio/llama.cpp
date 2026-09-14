@@ -106,3 +106,11 @@ Not yet: zero knowledge (masking in the GKR, a hiding commitment), the other ops
 ## Dependencies and licence
 
 Expander and its compiler collection are AGPL-3.0. They are pulled by git revision through Cargo, not vendored. The build uses a fork at `luiscosio/Expander`, branch `macos-build`, which differs from upstream by two small changes needed to link on macOS: the huge-page `madvise` call is Linux-only, and the CUDA feature gates are Linux-only with no-op stubs for the GPU symbols elsewhere. `Cargo.lock` pins the exact revisions.
+
+## Registered Groth16 verification policy
+
+Use `node groth16/verify_package.cjs KEY MANIFEST TENSOR GROUP PACKAGE_DIR` with independently trusted registration/v1 materials. `groth16/verify.js` is shared by the browser and offline entry point: it checks canonical signed field encodings, activation and sum bounds, registered shapes, group identity and the pinned verification key before the pairing check. Raw `snarkjs groth16 verify` alone does not enforce this application statement. Public q8/s1/s2 are part of the disclosed statement; Groth16 privacy is relative to all public values.
+
+`groth16_node.py --manifest` now invokes that shared verifier before reporting acceptance. Without a manifest it explicitly reports pairing/local-commitment checks only, with the shared registration/range policy skipped. `--progress-json` emits actual witness, proving and checking stages for local interfaces.
+
+The registration/v1 validator supports a deliberately fixed execution policy (including eight CPU threads and a 64-token prompt cap). Changing those fixed semantics requires an explicitly versioned schema/statement update. The registration writer pins the current experimental setup digest; rotating setup or keys requires regenerated matching materials and a new manifest ID, not silent replacement. The Python trace verifier also requires the native vocabulary checker for token/text correspondence; it is no longer a numpy/gguf-only verifier.
