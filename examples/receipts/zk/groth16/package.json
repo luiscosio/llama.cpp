@@ -1,0 +1,11 @@
+{
+  "name": "receipts-zk-groth16",
+  "private": true,
+  "description": "Zero-knowledge proof of one llama.cpp Q4_K x Q8_K matmul node: circom circuit, Groth16 via snarkjs, Poseidon commitment to the private weights",
+  "license": "MIT",
+  "dependencies": {
+    "circomlib": "2.0.5",
+    "circomlibjs": "0.1.7",
+    "snarkjs": "0.7.5"
+  }
+}
